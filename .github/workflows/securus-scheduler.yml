@@ -1,0 +1,179 @@
+name: Securus public scheduler
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+    - cron: "47 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/securus-scheduler.yml
+      - scripts/collect_source.sh
+      - scripts/collect_weather.py
+      - scripts/collect_kalshi.py
+      - scripts/run_crypto_paper.py
+      - scripts/verify_freshness.py
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: securus-public-runtime
+  cancel-in-progress: false
+
+jobs:
+  collect-and-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
+
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@v4
+
+      - name: Validate public scripts
+        if: github.event_name == 'push'
+        run: |
+          python -m py_compile \
+            scripts/collect_weather.py \
+            scripts/collect_kalshi.py \
+            scripts/run_crypto_paper.py \
+            scripts/verify_freshness.py
+          bash -n scripts/collect_source.sh
+
+      - name: Choose bounded cadence
+        id: cadence
+        shell: bash
+        run: |
+          set -euo pipefail
+          hour=$((10#$(date -u +%H)))
+          run_deep=false
+          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]] || \
+             { [[ "${{ github.event.schedule }}" == "17 * * * *" ]] && ((hour % 6 == 3)); }; then
+            run_deep=true
+          fi
+          echo "run_deep=$run_deep" >> "$GITHUB_OUTPUT"
+          echo "Deep-source refresh: $run_deep"
+
+      - name: Mint short-lived Securus identity
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce bounded storage maintenance
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error --retry 2 --retry-all-errors \
+            -X POST \
+            -H "Authorization: Bearer $SECURUS_OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"triggerName":"public-github-actions","maxArchives":12}' \
+            "$SECURUS_URL/api/storage-maintenance")
+          jq -e '.accepted == true' <<<"$response" >/dev/null
+          state=$(jq -r '.after.maintenanceState // .after.capacityState // "UNKNOWN"' <<<"$response")
+          echo "Storage maintenance completed: $state"
+          [[ "$state" != "CRITICAL" ]]
+
+      - name: Refresh hosted decision feeds
+        id: hosted
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -u
+          failures=()
+          for source in mlb-stats-api action-network sleeper-nfl nba-stats espn; do
+            if ! bash scripts/collect_source.sh "mode=fast&source=$source"; then
+              failures+=("$source")
+            fi
+          done
+          if ((${#failures[@]})); then
+            echo "Hosted collectors needing attention: ${failures[*]}" >&2
+            exit 1
+          fi
+
+      - name: Refresh event weather
+        id: weather
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: python scripts/collect_weather.py
+
+      - name: Refresh official Kalshi sports prices
+        id: kalshi
+        continue-on-error: true
+        env:
+          KEYLESS_SPORT: ALL
+        run: python scripts/collect_kalshi.py
+
+      - name: Refresh nationwide Kalshi climate markets
+        id: climate
+        continue-on-error: true
+        env:
+          KEYLESS_SPORT: CLIMATE
+        run: python scripts/collect_kalshi.py
+
+      - name: Refresh identity for deep sources
+        if: steps.cadence.outputs.run_deep == 'true'
+        id: oidc_deep
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh bounded deep statistics
+        if: steps.cadence.outputs.run_deep == 'true'
+        id: deep
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_deep.outputs.token }}
+        shell: bash
+        run: |
+          set -u
+          failures=()
+          for source in nflverse baseball-savant; do
+            if ! bash scripts/collect_source.sh "mode=daily&source=$source"; then
+              failures+=("$source")
+            fi
+          done
+          if ((${#failures[@]})); then
+            echo "Deep collectors needing attention: ${failures[*]}" >&2
+            exit 1
+          fi
+
+      - name: Require fresh decision inputs
+        run: >-
+          python scripts/verify_freshness.py "$SECURUS_URL"
+          --source mlb-stats-api
+          --source action-network
+          --source kalshi
+          --source climate
+          --source open-meteo
+          --source sleeper-nfl
+          --source nba-stats
+          --source espn
+          --source nflverse
+          --source baseball-savant
+
+      - name: Run one verified Crypto paper scan
+        run: python scripts/run_crypto_paper.py "$SECURUS_URL"
