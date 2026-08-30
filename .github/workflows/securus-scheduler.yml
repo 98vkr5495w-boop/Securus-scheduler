@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: "17 * * * *"
     - cron: "47 * * * *"
+    - cron: "23 5 1,15 * *"
   workflow_dispatch:
   push:
     branches: [main]
@@ -17,25 +18,20 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: securus-public-runtime
   cancel-in-progress: false
 
 jobs:
-  collect-and-scan:
+  validate:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    env:
-      SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
-
     steps:
       - name: Check out scheduler
         uses: actions/checkout@v4
 
       - name: Validate public scripts
-        if: github.event_name == 'push'
         run: |
           python -m py_compile \
             scripts/collect_weather.py \
@@ -43,6 +39,42 @@ jobs:
             scripts/run_crypto_paper.py \
             scripts/verify_freshness.py
           bash -n scripts/collect_source.sh
+
+  keepalive:
+    if: github.event_name == 'schedule' && github.event.schedule == '23 5 1,15 * *'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@v4
+
+      - name: Keep scheduled workflows active
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Last scheduler activity: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .scheduler-heartbeat
+          git config user.name "Securus Scheduler"
+          git config user.email "scheduler@users.noreply.github.com"
+          git add .scheduler-heartbeat
+          git commit -m "Keep public scheduler active" || exit 0
+          git push
+
+  collect-and-scan:
+    if: >-
+      github.event_name != 'push' &&
+      (github.event_name != 'schedule' || github.event.schedule != '23 5 1,15 * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
+
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@v4
 
       - name: Choose bounded cadence
         id: cadence
