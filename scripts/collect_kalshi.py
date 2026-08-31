@@ -29,8 +29,10 @@ SERIES: dict[str, list[dict[str, Any]]] = {
         {"ticker": "KXMLBHR", "market_family": "player_prop", "prop_metric": "home runs"},
     ],
     "NFL": [
-        {"ticker": "KXNFLGAME", "market_family": "moneyline", "required": True},
-        {"ticker": "KXNFLSPREAD", "market_family": "spread"},
+        # Regulation ties make team-winner contracts observation-only. The
+        # half-point spread family is the executable NFL readiness anchor.
+        {"ticker": "KXNFLGAME", "market_family": "moneyline"},
+        {"ticker": "KXNFLSPREAD", "market_family": "spread", "required": True},
         {"ticker": "KXNFLTOTAL", "market_family": "game_total"},
         {"ticker": "KXNFLTEAMTOTAL", "market_family": "team_total"},
     ],
