@@ -633,6 +633,7 @@ def collect_climate_forecasts(
     models_by_station: dict[str, list[dict[str, Any]]] = {
         station_id: [] for station_id in unique_stations
     }
+    ensembles_by_station: dict[str, dict[str, Any]] = {}
     stations = list(unique_stations.values())
     for model_id, label in CLIMATE_MODELS:
         for offset in range(0, len(stations), 10):
@@ -684,6 +685,71 @@ def collect_climate_forecasts(
                 time.sleep(0.75)
         time.sleep(0.75)
 
+    # Fetch true NOAA GEFS and ECMWF ensemble members in the public scheduler,
+    # then relay compact station/date histograms. The Site does not burst the
+    # provider directly and an absent relay fails closed instead of degrading
+    # deterministic forecasts into fake probabilities.
+    for offset in range(0, len(stations), 10):
+        batch = stations[offset : offset + 10]
+        query = urlencode(
+            {
+                "latitude": ",".join(str(station["latitude"]) for station in batch),
+                "longitude": ",".join(str(station["longitude"]) for station in batch),
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "temperature_unit": "fahrenheit",
+                "timezone": "auto",
+                "forecast_days": 4,
+                "models": "gfs_seamless,ecmwf_ifs025",
+            },
+            safe=",",
+        )
+        try:
+            payload = fetch_json(
+                f"https://ensemble-api.open-meteo.com/v1/ensemble?{query}"
+            )
+            responses = payload if isinstance(payload, list) else [payload]
+            for index, station in enumerate(batch):
+                response = responses[index] if index < len(responses) and isinstance(responses[index], dict) else {}
+                daily = response.get("daily") if isinstance(response.get("daily"), dict) else {}
+                dates = daily.get("time") if isinstance(daily.get("time"), list) else []
+                families: set[str] = set()
+                grouped: dict[tuple[str, str], list[float]] = {}
+                for field, raw_values in daily.items():
+                    match = re.fullmatch(
+                        r"(temperature_2m_(?:max|min))(?:_member\d+)?_(ncep_gefs_seamless|ecmwf_ifs025_ensemble)",
+                        str(field),
+                    )
+                    if not match or not isinstance(raw_values, list):
+                        continue
+                    families.add(match.group(2))
+                    for day_index, raw_value in enumerate(raw_values[:4]):
+                        if day_index >= len(dates) or not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", str(dates[day_index])):
+                            continue
+                        value = as_float(raw_value)
+                        if value is None or value < -150 or value > 160:
+                            continue
+                        grouped.setdefault((match.group(1), str(dates[day_index])), []).append(value)
+                histograms = []
+                for (field, date), values in sorted(grouped.items()):
+                    counts: dict[float, int] = {}
+                    for value in values:
+                        rounded = round(value, 1)
+                        counts[rounded] = counts.get(rounded, 0) + 1
+                    histograms.append(
+                        {"field": field, "date": date, "values": sorted(counts.items())}
+                    )
+                if len(families) >= 2 and histograms:
+                    ensembles_by_station[str(station["stationId"])] = {
+                        "familyIds": sorted(families),
+                        "histograms": histograms,
+                    }
+                else:
+                    failures.append(f"{station['stationId']}/ensemble: fewer than two usable families")
+        except Exception as error:
+            failures.append(f"ensemble batch {offset // 10 + 1}: {str(error)[:180]}")
+        if offset + 10 < len(stations):
+            time.sleep(1.0)
+
     forecasts = []
     for ticker, station in series_stations:
         models = models_by_station.get(str(station["stationId"]), [])
@@ -697,6 +763,7 @@ def collect_climate_forecasts(
                 "latitude": station["latitude"],
                 "longitude": station["longitude"],
                 "models": models,
+                "ensemble": ensembles_by_station.get(str(station["stationId"])),
             }
         )
     return forecasts, failures
@@ -909,4 +976,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
