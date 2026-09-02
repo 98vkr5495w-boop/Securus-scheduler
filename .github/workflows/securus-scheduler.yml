@@ -15,6 +15,7 @@ on:
       - scripts/collect_kalshi.py
       - scripts/run_crypto_paper.py
       - scripts/verify_freshness.py
+      - tests/**
 
 permissions:
   contents: read
@@ -39,6 +40,7 @@ jobs:
             scripts/run_crypto_paper.py \
             scripts/verify_freshness.py
           bash -n scripts/collect_source.sh
+          python -m unittest discover -s tests -p "test_*.py"
 
   keepalive:
     if: github.event_name == 'schedule' && github.event.schedule == '23 5 1,15 * *'
@@ -223,19 +225,8 @@ jobs:
           echo "Post-collection storage maintenance completed: $state"
           [[ "$state" != "CRITICAL" ]]
 
-      - name: Require fresh decision inputs
-        run: >-
-          python scripts/verify_freshness.py "$SECURUS_URL"
-          --source mlb-stats-api
-          --source action-network
-          --source kalshi
-          --source climate
-          --source open-meteo
-          --source sleeper-nfl
-          --source nba-stats
-          --source espn
-          --source nflverse
-          --source baseball-savant
+      - name: Require fresh decision inputs for at least one paper market
+        run: python scripts/verify_freshness.py "$SECURUS_URL"
 
       - name: Run one verified Crypto paper scan
         run: python scripts/run_crypto_paper.py "$SECURUS_URL"

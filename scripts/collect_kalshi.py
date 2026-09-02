@@ -106,7 +106,7 @@ def fetch_json(url: str, attempts: int = 5) -> Any:
         request = Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
         try:
             with urlopen(request, timeout=45) as response:
-                return json.load(response)
+                body = response.read()
         except HTTPError as error:
             last_error = error
             if error.code != 429 and error.code < 500:
@@ -117,6 +117,15 @@ def fetch_json(url: str, attempts: int = 5) -> Any:
         except (URLError, TimeoutError) as error:
             last_error = error
             delay = min(15.0, 2.0 ** attempt)
+        else:
+            try:
+                return json.loads(body)
+            except ValueError:
+                # An overloaded provider can answer 200 with an empty or HTML
+                # body. Treat that like a transient failure instead of losing
+                # the whole batch on the first malformed response.
+                last_error = RuntimeError(f"malformed JSON response: {body[:80]!r}")
+                delay = min(15.0, max(2.0, 2.0 ** attempt))
         if attempt + 1 < attempts:
             time.sleep(delay)
     raise RuntimeError(f"Request failed after {attempts} attempts: {last_error}")
