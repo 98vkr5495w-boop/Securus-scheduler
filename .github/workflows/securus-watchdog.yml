@@ -1,0 +1,36 @@
+name: Securus scheduler watchdog
+
+on:
+  schedule:
+    - cron: "22 * * * *"
+    - cron: "52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: securus-public-watchdog
+  cancel-in-progress: false
+
+jobs:
+  recover-overdue-scheduler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Dispatch only an overdue trusted scheduler
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/check_scheduler_due.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow securus-scheduler.yml \
+            --branch main \
+            --grace-minutes 15 \
+            --dispatch-if-due

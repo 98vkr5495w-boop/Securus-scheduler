@@ -9,7 +9,8 @@ the authenticated read-only status endpoint.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import sys
@@ -26,6 +27,20 @@ DEFAULT_POLL_ATTEMPTS = 60
 DEFAULT_POLL_DELAY_SECONDS = 5
 NONTERMINAL_STATUSES = {"QUEUED", "RUNNING"}
 TERMINAL_FAILURE_STATUSES = {"FAILED", "BLOCKED", "TIMED_OUT"}
+
+
+def deterministic_run_id(request_key: str, cycle_key: str) -> str:
+    """Return one UUIDv4-shaped ID per repository and canonical scheduler cycle."""
+    if not request_key:
+        raise ValueError("request_key must not be empty")
+    if not cycle_key:
+        raise ValueError("cycle_key must not be empty")
+    digest = bytearray(
+        hashlib.sha256(f"{request_key}:{cycle_key}".encode("utf-8")).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
 
 
 def securus_oidc_token() -> str:
@@ -327,12 +342,26 @@ def main() -> int:
         type=float,
         default=DEFAULT_POLL_DELAY_SECONDS,
     )
+    parser.add_argument(
+        "--request-key",
+        help="Stable repository identity for an automatic run",
+    )
+    parser.add_argument(
+        "--cycle-key",
+        help="Canonical UTC :07/:37 cycle key for an automatic run",
+    )
     args = parser.parse_args()
+    if bool(args.request_key) != bool(args.cycle_key):
+        parser.error("request-key and cycle-key must be supplied together")
     try:
         report = run_and_verify(
             args.url,
             poll_attempts=args.poll_attempts,
             poll_delay_seconds=args.poll_delay_seconds,
+            run_id=(
+                deterministic_run_id(args.request_key, args.cycle_key)
+                if args.request_key else None
+            ),
         )
     except Exception:
         # The public scheduler log is deliberately non-diagnostic. Detailed

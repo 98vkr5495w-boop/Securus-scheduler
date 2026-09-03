@@ -8,6 +8,16 @@ on:
     - cron: "37 * * * *"
     - cron: "23 5 1,15 * *"
   workflow_dispatch:
+    inputs:
+      recovery:
+        description: Run only when the full scheduler is overdue
+        required: false
+        default: false
+        type: boolean
+      cycle_key:
+        description: Canonical UTC :07/:37 cycle supplied by the watchdog
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
@@ -17,21 +27,32 @@ on:
       - scripts/collect_kalshi.py
       - scripts/run_crypto_paper.py
       - scripts/verify_freshness.py
+      - scripts/check_scheduler_due.py
+      - scripts/nba_injury_attestation.py
+      - tests/**
+      - .github/workflows/securus-watchdog.yml
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: securus-public-runtime
+  group: >-
+    ${{ github.event_name == 'push' && 'securus-public-validation-push'
+        || github.event_name == 'pull_request' && format('securus-public-validation-pr-{0}', github.event.pull_request.number)
+        || (github.event_name == 'schedule' && github.event.schedule == '23 5 1,15 * *')
+        && 'securus-public-keepalive'
+        || 'securus-public-runtime' }}
   cancel-in-progress: false
 
 jobs:
   validate:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out scheduler
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Validate public scripts
         run: |
@@ -39,8 +60,54 @@ jobs:
             scripts/collect_weather.py \
             scripts/collect_kalshi.py \
             scripts/run_crypto_paper.py \
-            scripts/verify_freshness.py
+            scripts/verify_freshness.py \
+            scripts/check_scheduler_due.py \
+            scripts/nba_injury_attestation.py
+          python -m unittest discover -s tests -v
           bash -n scripts/collect_source.sh
+
+  cadence-gate:
+    if: >-
+      github.event_name != 'push' && github.event_name != 'pull_request' &&
+      (github.event_name != 'schedule' || github.event.schedule != '23 5 1,15 * *')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      should_run: ${{ steps.due.outputs.should_run }}
+      cycle_key: ${{ steps.due.outputs.cycle_key }}
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Check full-run freshness
+        id: due
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RECOVERY: ${{ inputs.recovery }}
+          REQUESTED_CYCLE: ${{ inputs.cycle_key }}
+          SCHEDULED_SLOT: ${{ github.event.schedule == '7 * * * *' && '7' || github.event.schedule == '37 * * * *' && '37' || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$RECOVERY" != "true" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Explicit manual run bypasses the recovery cadence gate."
+          else
+            cycle_args=()
+            if [[ -n "$REQUESTED_CYCLE" ]]; then
+              cycle_args=(--cycle-key "$REQUESTED_CYCLE")
+            elif [[ -n "$SCHEDULED_SLOT" ]]; then
+              cycle_args=(--cycle-slot-minute "$SCHEDULED_SLOT")
+            fi
+            python scripts/check_scheduler_due.py \
+              --repository "$GITHUB_REPOSITORY" \
+              --workflow securus-scheduler.yml \
+              --branch main \
+              "${cycle_args[@]}" \
+              --github-output "$GITHUB_OUTPUT"
+          fi
 
   keepalive:
     if: github.event_name == 'schedule' && github.event.schedule == '23 5 1,15 * *'
@@ -49,7 +116,7 @@ jobs:
       contents: write
     steps:
       - name: Check out scheduler
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Keep scheduled workflows active
         shell: bash
@@ -62,10 +129,9 @@ jobs:
           git commit -m "Keep public scheduler active" || exit 0
           git push
 
-  collect-and-scan:
-    if: >-
-      github.event_name != 'push' &&
-      (github.event_name != 'schedule' || github.event.schedule != '23 5 1,15 * *')
+  collect-inputs:
+    needs: cadence-gate
+    if: needs.cadence-gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -73,21 +139,29 @@ jobs:
       id-token: write
     env:
       SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
+    outputs:
+      nba_attestation_required: ${{ steps.nba_challenge.outputs.required }}
+      nba_attestation_challenge: ${{ steps.nba_challenge.outputs.challenge }}
 
     steps:
       - name: Check out scheduler
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Choose bounded cadence
         id: cadence
         shell: bash
         run: |
           set -euo pipefail
-          hour=$((10#$(date -u +%H)))
           run_deep=false
-          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]] || \
-             { [[ "${{ github.event.schedule }}" == "7 * * * *" ]] && ((hour % 6 == 3)); }; then
+          cycle_key="${{ needs.cadence-gate.outputs.cycle_key }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "${{ inputs.recovery }}" != "true" ]]; then
             run_deep=true
+          elif [[ -n "$cycle_key" ]]; then
+            hour=$((10#$(date -u -d "$cycle_key" +%H)))
+            minute=$(date -u -d "$cycle_key" +%M)
+            if [[ "$minute" == "07" ]] && ((hour % 6 == 3)); then
+              run_deep=true
+            fi
           fi
           echo "run_deep=$run_deep" >> "$GITHUB_OUTPUT"
           echo "Deep-source refresh: $run_deep"
@@ -131,7 +205,7 @@ jobs:
         run: |
           set -u
           failures=()
-          for source in mlb-stats-api action-network sleeper-nfl nba-stats espn; do
+          for source in mlb-stats-api action-network sleeper-nfl nba-stats; do
             if ! bash scripts/collect_source.sh "mode=fast&source=$source"; then
               failures+=("$source")
             fi
@@ -140,6 +214,40 @@ jobs:
             echo "Hosted collectors needing attention: ${failures[*]}" >&2
             exit 1
           fi
+
+      - name: Refresh official NBA injury availability
+        id: nba_collect
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        shell: bash
+        run: bash scripts/collect_source.sh "mode=fast&source=nba-official-injuries"
+
+      - name: Refresh identity for the NBA PDF challenge
+        if: steps.nba_collect.outcome == 'success'
+        id: oidc_nba_challenge
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Obtain the hash-bound NBA PDF challenge
+        if: >-
+          steps.nba_collect.outcome == 'success' &&
+          steps.oidc_nba_challenge.outcome == 'success'
+        id: nba_challenge
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_nba_challenge.outputs.token }}
+        run: >-
+          python scripts/nba_injury_attestation.py challenge "$SECURUS_URL"
+          --github-output "$GITHUB_OUTPUT"
 
       - name: Refresh event weather
         id: weather
@@ -225,7 +333,90 @@ jobs:
           echo "Post-collection storage maintenance completed: $state"
           [[ "$state" != "CRITICAL" ]]
 
-      - name: Require fresh decision inputs
+  verify-nba-pdf:
+    needs: collect-inputs
+    if: >-
+      !cancelled() &&
+      needs.collect-inputs.result == 'success' &&
+      needs.collect-inputs.outputs.nba_attestation_required == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      nba_attestation: ${{ steps.verify.outputs.attestation }}
+    steps:
+      - name: Check out scheduler without persisted credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install the bounded PDF verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends poppler-utils
+          command -v pdftotext >/dev/null
+          pdftotext -v
+
+      - name: Verify the exact NBA report without credentials
+        id: verify
+        env:
+          NBA_ATTESTATION_CHALLENGE: ${{ needs.collect-inputs.outputs.nba_attestation_challenge }}
+        run: >-
+          python scripts/nba_injury_attestation.py verify
+          --github-output "$GITHUB_OUTPUT"
+
+  collect-and-scan:
+    name: collect-and-scan
+    needs: [cadence-gate, collect-inputs, verify-nba-pdf]
+    if: >-
+      !cancelled() &&
+      needs.cadence-gate.result == 'success' &&
+      needs.cadence-gate.outputs.should_run == 'true' &&
+      needs.collect-inputs.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Mint identity for the NBA PDF attestation
+        if: >-
+          needs.collect-inputs.outputs.nba_attestation_required == 'true' &&
+          needs.verify-nba-pdf.result == 'success' &&
+          needs.verify-nba-pdf.outputs.nba_attestation != ''
+        id: oidc_nba_attestation
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Submit bounded NBA availability evidence
+        if: steps.oidc_nba_attestation.outcome == 'success'
+        id: nba_attestation
+        continue-on-error: true
+        env:
+          NBA_ATTESTATION_RESULT: ${{ needs.verify-nba-pdf.outputs.nba_attestation }}
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_nba_attestation.outputs.token }}
+        run: python scripts/nba_injury_attestation.py submit "$SECURUS_URL"
+
+      - name: Require fresh non-NBA decision inputs
+        id: freshness
+        continue-on-error: true
         run: >-
           python scripts/verify_freshness.py "$SECURUS_URL"
           --source mlb-stats-api
@@ -235,9 +426,40 @@ jobs:
           --source open-meteo
           --source sleeper-nfl
           --source nba-stats
-          --source espn
           --source nflverse
           --source baseball-savant
 
       - name: Run one verified Crypto paper scan
-        run: python scripts/run_crypto_paper.py "$SECURUS_URL"
+        env:
+          REQUEST_KEY: ${{ github.repository_id }}
+          RECOVERY: ${{ inputs.recovery }}
+          CYCLE_KEY: ${{ needs.cadence-gate.outputs.cycle_key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" || "$RECOVERY" == "true" ]]; then
+            python scripts/run_crypto_paper.py "$SECURUS_URL" \
+              --request-key "$REQUEST_KEY" --cycle-key "$CYCLE_KEY"
+          else
+            python scripts/run_crypto_paper.py "$SECURUS_URL"
+          fi
+
+      - name: Surface an unassessable NBA attestation after the scan
+        if: >-
+          always() &&
+          (
+            steps.freshness.outcome != 'success' ||
+            !(
+              (needs.collect-inputs.outputs.nba_attestation_required == 'false' &&
+               needs.verify-nba-pdf.result == 'skipped' &&
+               steps.nba_attestation.outcome == 'skipped') ||
+              (needs.collect-inputs.outputs.nba_attestation_required == 'true' &&
+               needs.verify-nba-pdf.result == 'success' &&
+               needs.verify-nba-pdf.outputs.nba_attestation != '' &&
+               steps.nba_attestation.outcome == 'success')
+            )
+          )
+        shell: bash
+        run: |
+          echo "::error::One or more freshness or NBA attestation inputs were unassessable."
+          exit 1
