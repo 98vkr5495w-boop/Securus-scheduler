@@ -2,8 +2,10 @@ name: Securus public scheduler
 
 on:
   schedule:
-    - cron: "17 * * * *"
-    - cron: "47 * * * *"
+    # Keep both collection slots away from the top of the hour and make a
+    # workflow-file change so GitHub re-registers scheduled delivery.
+    - cron: "7 * * * *"
+    - cron: "37 * * * *"
     - cron: "23 5 1,15 * *"
   workflow_dispatch:
   push:
@@ -84,7 +86,7 @@ jobs:
           hour=$((10#$(date -u +%H)))
           run_deep=false
           if [[ "$GITHUB_EVENT_NAME" != "schedule" ]] || \
-             { [[ "${{ github.event.schedule }}" == "17 * * * *" ]] && ((hour % 6 == 3)); }; then
+             { [[ "${{ github.event.schedule }}" == "7 * * * *" ]] && ((hour % 6 == 3)); }; then
             run_deep=true
           fi
           echo "run_deep=$run_deep" >> "$GITHUB_OUTPUT"
