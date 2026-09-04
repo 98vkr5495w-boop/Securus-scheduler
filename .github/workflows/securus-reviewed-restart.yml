@@ -63,7 +63,7 @@ jobs:
             .climateShadowOnly == true and
             .realMoneyExecution == false
           ' <<<"$response" >/dev/null
-          echo "Reviewed restart recorded at the retained $191.71 paper bankroll."
+          echo "Reviewed restart recorded at the retained 191.71-dollar paper bankroll."
 
       - name: Verify live safety and learning state
         shell: bash
