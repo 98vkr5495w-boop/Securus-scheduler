@@ -59,6 +59,20 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertNotIn("nba-official-injuries", freshness)
         self.assertIn("--source nba-stats", freshness)
 
+    def test_hosted_collectors_refresh_identity_after_maintenance(self):
+        maintenance_offset = self.collect.index("Enforce bounded storage maintenance")
+        refresh_offset = self.collect.index("Refresh identity after storage maintenance")
+        hosted_offset = self.collect.index("Refresh hosted decision feeds")
+        self.assertLess(maintenance_offset, refresh_offset)
+        self.assertLess(refresh_offset, hosted_offset)
+        hosted_block = self.collect[hosted_offset:self.collect.index(
+            "Refresh official NBA injury availability"
+        )]
+        self.assertIn(
+            "SECURUS_OIDC_TOKEN: ${{ steps.oidc_collect.outputs.token }}",
+            hosted_block,
+        )
+
     def test_unassessable_nba_does_not_suppress_other_sport_scan(self):
         scan_offset = self.final.index("Run one verified Crypto paper scan")
         surface_offset = self.final.index("Surface an unassessable NBA attestation")

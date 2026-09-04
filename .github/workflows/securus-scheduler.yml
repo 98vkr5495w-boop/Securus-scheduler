@@ -196,11 +196,23 @@ jobs:
           echo "Storage maintenance completed: $state"
           [[ "$state" != "CRITICAL" ]]
 
+      - name: Refresh identity after storage maintenance
+        id: oidc_collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
       - name: Refresh hosted decision feeds
         id: hosted
         continue-on-error: true
         env:
-          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_collect.outputs.token }}
         shell: bash
         run: |
           set -u
@@ -219,7 +231,7 @@ jobs:
         id: nba_collect
         continue-on-error: true
         env:
-          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_collect.outputs.token }}
         shell: bash
         run: bash scripts/collect_source.sh "mode=fast&source=nba-official-injuries"
 
@@ -253,7 +265,7 @@ jobs:
         id: weather
         continue-on-error: true
         env:
-          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_collect.outputs.token }}
         run: python scripts/collect_weather.py
 
       - name: Refresh official Kalshi sports prices
