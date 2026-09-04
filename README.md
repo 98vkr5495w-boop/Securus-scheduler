@@ -9,6 +9,10 @@ Authentication uses a short-lived GitHub Actions OIDC identity. Securus independ
 The primary workflow uses standard GitHub-hosted runners on an off-peak
 30-minute cadence, prevents overlapping runs, checks decision-critical source
 freshness, and submits at most one journaled paper scan per completed cycle.
+Every call to Securus or to GitHub's OIDC endpoint carries an explicit connect
+and total timeout so a hung edge cannot stall a job until its limit, and the
+idempotent status read behind the freshness gate retries transient failures
+with backoff before it fails a cycle closed.
 Because GitHub schedules are best-effort, an isolated watchdog checks 15 minutes
 after each primary slot and dispatches the existing trusted scheduler only when
 no successful `collect-and-scan` job completed recently. The watchdog has

@@ -98,15 +98,43 @@ def fetch_json(url: str, attempts: int = 5) -> Any:
     raise RuntimeError(f"request failed after {attempts} attempts: {last_error}")
 
 
+def securus_oidc_token() -> str:
+    """Return a fresh Securus OIDC identity whenever the runner can mint one.
+
+    GitHub OIDC tokens are short-lived. Minting per request (as the Kalshi and
+    paper-scan clients already do) keeps a slow collection step from posting
+    with an expired identity.
+    """
+    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+    request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+    if request_url and request_token:
+        separator = "&" if "?" in request_url else "?"
+        request = Request(
+            f"{request_url}{separator}audience=securus-collector",
+            headers={"Authorization": f"bearer {request_token}"},
+        )
+        with urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+        token = str(payload.get("value") or "")
+        if not token:
+            raise RuntimeError("GitHub OIDC response did not include a token")
+        print(f"::add-mask::{token}")
+        os.environ["SECURUS_OIDC_TOKEN"] = token
+        return token
+    token = os.environ.get("SECURUS_OIDC_TOKEN", "")
+    if not token:
+        raise RuntimeError("Securus OIDC identity is unavailable")
+    return token
+
+
 def post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     securus_url = os.environ["SECURUS_URL"].rstrip("/")
-    oidc_token = os.environ["SECURUS_OIDC_TOKEN"]
     request = Request(
         f"{securus_url}{path}",
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
         method="POST",
         headers={
-            "Authorization": f"Bearer {oidc_token}",
+            "Authorization": f"Bearer {securus_oidc_token()}",
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
         },

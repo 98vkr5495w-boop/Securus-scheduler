@@ -7,8 +7,16 @@ import argparse
 from datetime import datetime, timezone
 import json
 import sys
+import time
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+
+USER_AGENT = "Securus-Public-Watchdog/1.1"
+DEFAULT_STATUS_ATTEMPTS = 3
+DEFAULT_STATUS_TIMEOUT_SECONDS = 45
 
 
 MAX_AGE_MINUTES = {
@@ -33,6 +41,47 @@ def parse_timestamp(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed.astimezone(timezone.utc) if parsed.utcoffset() is not None else None
+
+
+def load_status(
+    base_url: str,
+    *,
+    attempts: int = DEFAULT_STATUS_ATTEMPTS,
+    timeout_seconds: float = DEFAULT_STATUS_TIMEOUT_SECONDS,
+    opener: Callable[..., Any] = urlopen,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    """Fetch the public Securus status document, retrying transient failures.
+
+    The status read is an idempotent GET, so a slow edge, a dropped connection,
+    or a momentary 5xx must not fail a whole 30-minute cycle on its own. Client
+    errors other than 429 are reported immediately because retrying them cannot
+    help.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    url = f"{base_url.rstrip('/')}/api/data-sources"
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        request = Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        )
+        try:
+            with opener(request, timeout=timeout_seconds) as response:
+                payload = json.load(response)
+            if not isinstance(payload, dict):
+                raise RuntimeError("Securus status is not a JSON object")
+            return payload
+        except HTTPError as error:
+            last_error = error
+            if error.code < 500 and error.code != 429:
+                raise RuntimeError(f"HTTP {error.code}") from error
+        except (URLError, TimeoutError, ValueError, RuntimeError) as error:
+            last_error = error
+        if attempt + 1 < attempts:
+            sleeper(min(20.0, 3.0 * (2**attempt)))
+    raise RuntimeError(f"unavailable after {attempts} attempts: {last_error}")
 
 
 def freshness_failures(
@@ -74,15 +123,13 @@ def main() -> int:
     parser.add_argument("--source", action="append", dest="sources", default=[])
     args = parser.parse_args()
 
-    request = Request(
-        f"{args.url.rstrip('/')}/api/data-sources",
-        headers={"Accept": "application/json", "User-Agent": "Securus-Public-Watchdog/1.0"},
-    )
     try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except Exception:
-        print("Freshness gate failed: Securus status is unavailable.", file=sys.stderr)
+        payload = load_status(args.url)
+    except Exception as error:
+        print(
+            f"Freshness gate failed: Securus status is unavailable ({error}).",
+            file=sys.stderr,
+        )
         return 1
 
     now = datetime.now(timezone.utc)

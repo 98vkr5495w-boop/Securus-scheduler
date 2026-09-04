@@ -9,6 +9,7 @@ source_id=${query#*source=}
 source_id=${source_id%%&*}
 
 response=$(curl --fail-with-body --silent --show-error \
+  --connect-timeout 15 --max-time 180 \
   --retry 2 --retry-all-errors \
   -X POST \
   -H "Authorization: Bearer ${SECURUS_OIDC_TOKEN}" \
