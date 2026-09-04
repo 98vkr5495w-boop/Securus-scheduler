@@ -1,0 +1,90 @@
+name: Securus reviewed Crypto restart
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/securus-reviewed-restart.yml
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: securus-reviewed-crypto-restart-2026-09-04
+  cancel-in-progress: false
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
+      RESTART_REQUEST_ID: owner-reviewed-2026-09-04-sports-restart
+      RESTART_REASON: Owner approved a sports-only restart at the live bankroll after reviewing the hard drawdown pause.
+    steps:
+      - name: Mint short-lived Securus identity
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Apply the owner-reviewed sports restart
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload=$(jq -cn \
+            --arg requestId "$RESTART_REQUEST_ID" \
+            --arg reason "$RESTART_REASON" \
+            '{requestId: $requestId, reason: $reason}')
+          response=$(curl --fail-with-body --silent --show-error --retry 2 --retry-all-errors \
+            -X POST \
+            -H "Authorization: Bearer $SECURUS_OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$SECURUS_URL/api/paper-risk-restart")
+          jq -e '
+            .accepted == true and
+            .mode == "SPORTS_ONLY" and
+            .baselineBankroll == 191.71 and
+            .previousDrawdownFraction >= 0.05 and
+            .historyPreserved == true and
+            .settledBetsPreserved >= 91 and
+            .lossesPreserved >= 49 and
+            .climateShadowOnly == true and
+            .realMoneyExecution == false
+          ' <<<"$response" >/dev/null
+          echo "Reviewed restart recorded at the retained $191.71 paper bankroll."
+
+      - name: Verify live safety and learning state
+        shell: bash
+        run: |
+          set -euo pipefail
+          performance=$(curl --fail-with-body --silent --show-error --retry 2 --retry-all-errors \
+            -H "Accept: application/json" \
+            "$SECURUS_URL/api/paper-performance")
+          jq -e '
+            .experiment.mode == "PAPER_ONLY" and
+            .agents[0].agentType == "CRYPTO" and
+            .agents[0].currentBankroll == 191.71 and
+            .agents[0].openBets == 0 and
+            .agents[0].sleeves.sports.mode == "NORMAL" and
+            .agents[0].sleeves.climate.status == "NO_BET" and
+            any(.agents[0].sleeves.climate.blockers[]; contains("shadow-only")) and
+            .strategy.riskControls.reviewedRestartActive == true and
+            .strategy.riskControls.riskBaselineBankroll == 191.71 and
+            .strategy.riskControls.currentDrawdownFraction == 0 and
+            .selfAnalysis.settledBets >= 91 and
+            .agents[0].learningObservations >= 3922 and
+            .safeguards.realMoneyExecution == false
+          ' <<<"$performance" >/dev/null
+          echo "Crypto is restart-ready, history remains available to learning, and climate remains blocked."
