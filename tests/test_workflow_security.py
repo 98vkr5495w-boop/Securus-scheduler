@@ -14,6 +14,17 @@ def job_block(source: str, job_id: str, next_job_id: str | None = None) -> str:
 
 
 class WorkflowSecurityTests(unittest.TestCase):
+    def test_watchdog_checks_ten_minutes_and_trusted_completions_without_oidc(self):
+        watchdog = (WORKFLOW.parent / "securus-watchdog.yml").read_text(encoding="utf-8")
+        self.assertIn('cron: "2,12,22,32,42,52 * * * *"', watchdog)
+        self.assertIn('workflows: ["Securus public scheduler"]', watchdog)
+        self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", watchdog)
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", watchdog)
+        self.assertIn('["push","schedule","workflow_dispatch"]', watchdog)
+        self.assertNotIn("id-token:", watchdog)
+        self.assertNotIn("--grace-minutes 15", watchdog)
+        self.assertIn("cancel-in-progress: false", watchdog)
+
     @classmethod
     def setUpClass(cls):
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
