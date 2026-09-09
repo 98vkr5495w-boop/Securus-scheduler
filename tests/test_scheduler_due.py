@@ -211,6 +211,27 @@ class SchedulerDueTests(unittest.TestCase):
             payload["sources"][0]["lastRun"] = replacement
             self.assertTrue(source_refresh_due(payload, now))
 
+    def test_cooldown_preserves_the_diagnostic_cause(self):
+        now = CYCLE + timedelta(minutes=70)
+        api = fake_api(started_at=format_cycle_key(now), completed_at=None, conclusion="failure")
+        deep = self.sources(now)
+        for row in deep["sources"]:
+            if row["id"] in DEEP_SOURCES:
+                row["lastRun"]["completedAt"] = format_cycle_key(now - timedelta(hours=6))
+        def unavailable():
+            raise RuntimeError("response body must not be logged")
+        for source_get, cause in [
+            (lambda: self.sources(now, 31), "frequent feed"),
+            (lambda: deep, "deep-stat feed"),
+            (unavailable, "could not be verified"),
+        ]:
+            due, reason = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main",
+                cycle_start(now), now=now, source_get=source_get)
+            self.assertFalse(due)
+            self.assertIn(cause, reason)
+            self.assertIn("cooldown", reason)
+            self.assertNotIn("response body", reason)
+
     def test_failed_status_reads_are_bounded_by_actual_collection_attempts(self):
         now = CYCLE + timedelta(minutes=70)
         def unavailable():

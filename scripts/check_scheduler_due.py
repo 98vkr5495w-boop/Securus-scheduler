@@ -174,9 +174,13 @@ def scheduler_is_due(
         github_error = True
     if source_get is not None:
         try:
-            if not source_refresh_due(source_get(), now):
+            payload = source_get()
+            if sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES):
+                reason = "a frequent feed is missing, failed, or due for its 30-minute refresh"
+            elif deep_refresh_due(payload, now):
+                reason = "a deep-stat feed is missing, failed, or due for its six-hour refresh"
+            else:
                 return False, "frequent feeds are under 30 minutes old and deep feeds are within their six-hour cadence"
-            reason = "a feed is missing, failed, or due for its frequent/deep refresh cadence"
         except Exception:
             reason = "live source timestamps could not be verified"
         if github_error:
@@ -184,7 +188,7 @@ def scheduler_is_due(
             # when both status services are unavailable and cooldown is unknown.
             return False, "collection history unavailable; recovery deferred to the next check, not confirmed healthy"
         if attempted_at is not None and timedelta(0) <= now - attempted_at < timedelta(minutes=RETRY_COOLDOWN_MINUTES):
-            return False, "collection attempt is within the bounded 10-minute retry cooldown; readiness remains fail-closed"
+            return False, f"{reason}; collection attempt is within the bounded 10-minute retry cooldown; readiness remains fail-closed"
         return True, reason
     if github_error:
         return True, "GitHub status could not be verified"
