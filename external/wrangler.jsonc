@@ -1,0 +1,8 @@
+{
+  "name": "securus-recovery",
+  "main": "recovery-worker.mjs",
+  "compatibility_date": "2026-09-10",
+  "workers_dev": true,
+  "triggers": { "crons": ["2,12,22,32,42,52 * * * *"] },
+  "observability": { "enabled": true }
+}

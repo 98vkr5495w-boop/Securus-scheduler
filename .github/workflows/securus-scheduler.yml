@@ -30,6 +30,7 @@ on:
       - scripts/check_scheduler_due.py
       - scripts/nba_injury_attestation.py
       - tests/**
+      - external/**
       - .github/workflows/securus-watchdog.yml
   pull_request:
     branches: [main]
@@ -64,6 +65,7 @@ jobs:
             scripts/check_scheduler_due.py \
             scripts/nba_injury_attestation.py
           python -m unittest discover -s tests -v
+          node --test tests/test_external_recovery.mjs
           bash -n scripts/collect_source.sh
 
   cadence-gate:

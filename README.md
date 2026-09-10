@@ -35,6 +35,10 @@ scan twice. The cadence gate and shared scheduler concurrency limit redundant
 collection writes. Both workflows still share GitHub as a provider, so the
 watchdog reduces missed-trigger risk but is not an independent uptime guarantee.
 
+The prepared [external recovery Worker](external/README.md) supplies a separate
+ten-minute timer after account deployment and secure credential setup. Its
+presence in this repository is not proof that independent delivery is active.
+
 Official NBA injury-report availability is independently checked on a separate
 runner job with no OIDC capability. That job downloads only the exact NBA PDF
 named by Securus, verifies its byte count and SHA-256 digest, and uses Poppler's
