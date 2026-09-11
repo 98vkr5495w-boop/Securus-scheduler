@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import sys
+import time
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -42,7 +44,7 @@ def freshness_failures(
 ) -> list[str]:
     latest = {
         str(row.get("id")): row.get("lastRun") or {}
-        for row in payload.get("sources", [])
+        for row in (payload.get("sources") or [])
         if isinstance(row, dict)
     }
     failures: list[str] = []
@@ -59,13 +61,51 @@ def freshness_failures(
             failures.append("nba-official-injuries has no verified active-season report")
             continue
         age_minutes = (now - completed_at).total_seconds() / 60
+        if age_minutes < 0:
+            failures.append(f"{source} has a future completion timestamp")
         if age_minutes > MAX_AGE_MINUTES.get(source, 75):
-            failures.append(f"{source} stale")
+            failures.append(f"{source} stale (last success {run['completedAt']}; age {age_minutes:.1f}m; limit {MAX_AGE_MINUTES.get(source, 75)}m)")
 
     capacity = ((payload.get("storage") or {}).get("capacity") or {})
-    if capacity.get("capacityState") == "CRITICAL":
+    utilization = capacity.get("utilizationPercent")
+    if capacity.get("capacityState") not in ("NORMAL", "WARNING", "CRITICAL") or type(utilization) not in (int, float) or not math.isfinite(utilization) or utilization < 0:
+        failures.append("storage health unavailable")
+    elif capacity.get("capacityState") == "CRITICAL" or utilization >= 85 or capacity.get("maintenanceState") == "CRITICAL":
         failures.append("storage critical")
     return failures
+
+
+def verify_with_rechecks(load, wanted, *, clock=lambda: datetime.now(timezone.utc), sleep=time.sleep):
+    """Cross the public status cache TTL without refreshing sources or relaxing limits."""
+    failures = []
+    for attempt in range(4):
+        try:
+            failures = freshness_failures(load(), wanted, clock())
+        except Exception:
+            failures = ["Securus status is unavailable"]
+        if not failures or any(failure.startswith("storage") for failure in failures):
+            return failures
+        if attempt < 3:
+            print("Rechecking public status after cache expiry: " + ", ".join(failures), file=sys.stderr)
+            sleep(15)
+    return failures
+
+
+def read_status(url):
+    request = Request(
+        f"{url.rstrip('/')}/api/data-sources",
+        headers={"Accept": "application/json", "Cache-Control": "no-cache", "User-Agent": "Securus-Public-Watchdog/2.0"},
+    )
+    with urlopen(request, timeout=20) as response:
+        if "application/json" not in response.headers.get("Content-Type", "").lower():
+            raise ValueError("status is not JSON")
+        raw = response.read(524289)
+    if len(raw) > 524288:
+        raise ValueError("status exceeds size limit")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("status is not an object")
+    return payload
 
 
 def main() -> int:
@@ -74,22 +114,11 @@ def main() -> int:
     parser.add_argument("--source", action="append", dest="sources", default=[])
     args = parser.parse_args()
 
-    request = Request(
-        f"{args.url.rstrip('/')}/api/data-sources",
-        headers={"Accept": "application/json", "User-Agent": "Securus-Public-Watchdog/1.0"},
-    )
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except Exception:
-        print("Freshness gate failed: Securus status is unavailable.", file=sys.stderr)
-        return 1
-
     now = datetime.now(timezone.utc)
     wanted = set(args.sources or MAX_AGE_MINUTES)
     if now.astimezone(ZoneInfo("America/New_York")).month in (8, 9):
         wanted.difference_update({"nba-stats", "nba-official-injuries"})
-    failures = freshness_failures(payload, wanted, now)
+    failures = verify_with_rechecks(lambda: read_status(args.url), wanted)
 
     if failures:
         print("Freshness gate failed: " + ", ".join(failures) + ".", file=sys.stderr)

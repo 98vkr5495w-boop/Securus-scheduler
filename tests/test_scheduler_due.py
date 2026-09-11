@@ -30,7 +30,7 @@ def fake_api(
 ):
     def load(path):
         if "/runs?" in path:
-            return {"workflow_runs": [{"id": 42}]}
+            return {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "schedule", "status": "completed"}]}
         return {"jobs": [{
             "name": job_name,
             "conclusion": conclusion,
@@ -41,6 +41,74 @@ def fake_api(
 
 
 class SchedulerDueTests(unittest.TestCase):
+    def test_recovery_blocks_unknown_storage_and_pending_runtime(self):
+        now = CYCLE + timedelta(hours=3)
+        for capacity in [None, {},
+                         {"capacityState": "NORMAL", "utilizationPercent": float('nan')}]:
+            state = self.sources(now, 60)
+            state["storage"]["capacity"] = capacity
+            dispatched = []
+            due, reason = recover_cycle(fake_api(), lambda *a, **kw: dispatched.append(kw),
+                "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+                source_get=lambda: state)
+            self.assertFalse(due)
+            self.assertIn("storage", reason)
+            self.assertEqual(dispatched, [])
+        for status in ["queued", "in_progress", "waiting", "pending", "requested"]:
+            def api(path):
+                if "/runs?" in path:
+                    return {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "workflow_dispatch", "status": status}]}
+                self.fail("pending runtime must block before job reads")
+            due, reason = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main",
+                cycle_start(now), now=now, source_get=lambda: self.sources(now, 60))
+            self.assertFalse(due)
+            self.assertIn("queued or in progress", reason)
+
+    def test_critical_storage_only_dispatches_separate_maintenance_mode(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 60)
+        state["storage"]["capacity"] = {"capacityState": "CRITICAL", "utilizationPercent": 85.2}
+        calls = []
+        due, _ = scheduler_is_due(fake_api(), "owner/repo", "securus-scheduler.yml", "main",
+            cycle_start(now), now=now, source_get=lambda: state)
+        self.assertFalse(due, "critical storage must never allow collection")
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertTrue(due)
+        self.assertEqual(calls[0]["payload"]["inputs"]["maintenance_only"], "true")
+        self.assertEqual(calls[0]["payload"]["ref"], "main")
+
+    def test_recent_maintenance_and_unfinished_collectors_block_repair_loops(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 60)
+        state["storage"]["capacity"] = {"capacityState": "CRITICAL", "utilizationPercent": 85.2}
+        calls = []
+        api = fake_api(job_name="maintain-storage", started_at=(now-timedelta(minutes=2)).isoformat())
+        due, _ = recover_cycle(api, lambda *a, **kw: calls.append(kw), "owner/repo",
+            "securus-scheduler.yml", "main", cycle_start(now), now=now, source_get=lambda: state)
+        self.assertFalse(due)
+        state["sources"][0]["lastRun"]["status"] = "RUNNING"
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw), "owner/repo",
+            "securus-scheduler.yml", "main", cycle_start(now), now=now, source_get=lambda: state)
+        self.assertFalse(due)
+        self.assertEqual(calls, [])
+
+    def test_current_cadence_run_does_not_block_itself(self):
+        now = CYCLE + timedelta(hours=3)
+        api = lambda path: {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "schedule", "status": "in_progress"}]}
+        due, _ = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main", cycle_start(now),
+            now=now, source_get=lambda: self.sources(now, 60), exclude_run_id=42)
+        self.assertTrue(due)
+
+    def test_malformed_history_is_not_an_empty_successful_history(self):
+        now = CYCLE + timedelta(hours=3)
+        for history in [{}, {"workflow_runs": None}, {"workflow_runs": [{"id": 42}]}]:
+            due, reason = scheduler_is_due(lambda path: history, "owner/repo", "securus-scheduler.yml", "main",
+                cycle_start(now), now=now, source_get=lambda: self.sources(now, 60))
+            self.assertFalse(due)
+            self.assertIn("history unavailable", reason)
+
     def check(self, api):
         return scheduler_is_due(
             api,
@@ -71,7 +139,7 @@ class SchedulerDueTests(unittest.TestCase):
         def failed(_path):
             raise RuntimeError("unavailable")
         due, reason = self.check(failed)
-        self.assertEqual(due, True)
+        self.assertEqual(due, False)
         self.assertIn("could not be verified", reason)
 
     def test_boundaries_are_anchored_at_07_and_37(self):
@@ -169,7 +237,7 @@ class SchedulerDueTests(unittest.TestCase):
         self.assertEqual(dispatched, [])
 
     def sources(self, now, age=0):
-        return {"sources": [{"id": source, "lastRun": {
+        return {"storage": {"capacity": {"capacityState": "NORMAL", "utilizationPercent": 50}}, "sources": [{"id": source, "lastRun": {
             "status": "SUCCEEDED", "completedAt": format_cycle_key(now - timedelta(minutes=age)),
         }} for source in FREQUENT_SOURCES | DEEP_SOURCES]}
 
@@ -223,7 +291,6 @@ class SchedulerDueTests(unittest.TestCase):
         for source_get, cause in [
             (lambda: self.sources(now, 31), "frequent feed"),
             (lambda: deep, "deep-stat feed"),
-            (unavailable, "could not be verified"),
         ]:
             due, reason = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main",
                 cycle_start(now), now=now, source_get=source_get)
@@ -236,7 +303,7 @@ class SchedulerDueTests(unittest.TestCase):
         now = CYCLE + timedelta(minutes=70)
         def unavailable():
             raise RuntimeError("not accessible")
-        for age, expected in [(0, False), (9, False), (10, True), (31, True)]:
+        for age, expected in [(0, False), (9, False), (10, False), (31, False)]:
             api = fake_api(started_at=format_cycle_key(now - timedelta(minutes=age)),
                            completed_at=None, conclusion="failure")
             due, _ = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main",
@@ -244,7 +311,7 @@ class SchedulerDueTests(unittest.TestCase):
             self.assertEqual(due, expected)
         due, _ = scheduler_is_due(fake_api(job_name="collect-and-scan", started_at=format_cycle_key(now)),
             "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now, source_get=unavailable)
-        self.assertTrue(due, "a scan-only rerun cannot postpone recovery")
+        self.assertFalse(due, "unavailable storage must block recovery even after a scan-only rerun")
 
     def test_missing_cooldown_history_cannot_start_recursive_recovery_storm(self):
         now = CYCLE + timedelta(minutes=70)

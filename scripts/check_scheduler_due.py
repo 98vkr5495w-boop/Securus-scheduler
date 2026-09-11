@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -71,6 +72,7 @@ def collection_timestamps(
     repository: str,
     workflow: str,
     branch: str,
+    exclude_run_id: int | None = None,
 ) -> tuple[datetime | None, datetime | None]:
     query = urlencode({"branch": branch, "per_page": 20})
     payload = api_get(
@@ -78,25 +80,62 @@ def collection_timestamps(
     )
     completions: list[datetime] = []
     attempts: list[datetime] = []
-    for run in payload.get("workflow_runs", []):
-        if not isinstance(run, dict) or not isinstance(run.get("id"), int):
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list):
+        raise ValueError("collection history unavailable")
+    for run in runs:
+        if not isinstance(run, dict) or type(run.get("id")) is not int:
+            raise ValueError("invalid workflow run")
+        if run["id"] == exclude_run_id:
             continue
+        if not isinstance(run.get("head_branch"), str) or not isinstance(run.get("event"), str):
+            raise ValueError("workflow origin unavailable")
+        if run.get("head_branch") != branch or run.get("event") not in ("schedule", "workflow_dispatch"):
+            continue
+        if run.get("status") not in ("completed", "queued", "in_progress", "waiting", "pending", "requested"):
+            raise ValueError("workflow status unavailable")
+        if run["status"] != "completed":
+            raise CollectionPending("runtime already queued or in progress")
         jobs = api_get(
             f"/repos/{repository}/actions/runs/{run['id']}/jobs?"
             + urlencode({"filter": "latest", "per_page": 100})
         )
-        for job in jobs.get("jobs", []):
+        if not isinstance(jobs.get("jobs"), list) or jobs.get("total_count", len(jobs["jobs"])) > len(jobs["jobs"]):
+            raise ValueError("incomplete collection job history")
+        for job in jobs["jobs"]:
             if not isinstance(job, dict):
                 continue
-            if job.get("name") != COLLECT_JOB_NAME:
+            if job.get("name") not in (COLLECT_JOB_NAME, "maintain-storage"):
                 continue
             started_at = parse_timestamp(job.get("started_at"))
+            if job.get("conclusion") != "skipped" and started_at is None:
+                raise ValueError("collection timestamp unavailable")
             if started_at is not None and job.get("conclusion") != "skipped":
                 attempts.append(started_at)
             completed_at = parse_timestamp(job.get("completed_at"))
-            if completed_at is not None and job.get("conclusion") == "success":
+            if job.get("name") == COLLECT_JOB_NAME and completed_at is not None and job.get("conclusion") == "success":
                 completions.append(completed_at)
     return max(attempts, default=None), max(completions, default=None)
+
+
+class CollectionPending(RuntimeError):
+    pass
+
+
+def storage_blocker(payload: dict[str, Any]) -> str | None:
+    capacity = (payload.get("storage") or {}).get("capacity") or {}
+    state, utilization = capacity.get("capacityState"), capacity.get("utilizationPercent")
+    if state not in ("NORMAL", "WARNING", "CRITICAL") or type(utilization) not in (int, float) or not math.isfinite(utilization) or utilization < 0:
+        return "live storage health unavailable; collection blocked"
+    if state == "CRITICAL" or utilization >= 85 or capacity.get("maintenanceState") == "CRITICAL":
+        return "storage critical; verified maintenance is required before collection"
+    return None
+
+
+def collection_in_progress(payload: dict[str, Any]) -> bool:
+    return any(isinstance(row, dict) and isinstance(row.get("lastRun"), dict) and
+               row["lastRun"].get("status") in ("RUNNING", "QUEUED", "IN_PROGRESS")
+               for row in payload.get("sources", []))
 
 
 def sources_due(payload: dict[str, Any], now: datetime, sources: frozenset[str], minutes: int) -> bool:
@@ -162,19 +201,27 @@ def scheduler_is_due(
     *,
     now: datetime | None = None,
     source_get: Callable[[], dict[str, Any]] | None = None,
+    exclude_run_id: int | None = None,
 ) -> tuple[bool, str]:
     now = now or boundary
     attempted_at = completed_at = None
     github_error = False
     try:
         attempted_at, completed_at = collection_timestamps(
-            api_get, repository, workflow, branch
+            api_get, repository, workflow, branch, exclude_run_id
         )
+    except CollectionPending as error:
+        return False, str(error)
     except Exception:
         github_error = True
     if source_get is not None:
         try:
             payload = source_get()
+            if collection_in_progress(payload):
+                return False, "a runtime source collection is unfinished; recovery deferred"
+            blocker = storage_blocker(payload)
+            if blocker:
+                return False, blocker
             if sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES):
                 reason = "a frequent feed is missing, failed, or due for its 30-minute refresh"
             elif deep_refresh_due(payload, now):
@@ -182,16 +229,16 @@ def scheduler_is_due(
             else:
                 return False, "frequent feeds are under 30 minutes old and deep feeds are within their six-hour cadence"
         except Exception:
-            reason = "live source timestamps could not be verified"
+            return False, "live source timestamps and storage could not be verified; recovery deferred, not confirmed healthy"
         if github_error:
             # In particular, do not recursively dispatch on every completion
             # when both status services are unavailable and cooldown is unknown.
             return False, "collection history unavailable; recovery deferred to the next check, not confirmed healthy"
-        if attempted_at is not None and timedelta(0) <= now - attempted_at < timedelta(minutes=RETRY_COOLDOWN_MINUTES):
+        if attempted_at is not None and now - attempted_at < timedelta(minutes=RETRY_COOLDOWN_MINUTES):
             return False, f"{reason}; collection attempt is within the bounded 10-minute retry cooldown; readiness remains fail-closed"
         return True, reason
     if github_error:
-        return True, "GitHub status could not be verified"
+        return False, "GitHub status could not be verified; recovery deferred, not confirmed healthy"
     if completed_at is None:
         return True, "no successful collect-inputs job was found"
     if now - completed_at >= timedelta(minutes=REFRESH_MINUTES):
@@ -221,16 +268,30 @@ def recover_cycle(
     due, reason = scheduler_is_due(
         api_get, repository, workflow, branch, boundary, now=now, source_get=source_get
     )
+    maintenance_only = False
+    # Critical storage never authorizes collection. The same trusted workflow
+    # has a separate maintenance-only mode; its cadence/collection/scan jobs
+    # cannot run. Observe the same known-idle history and repair cooldown.
+    if not due and source_get is not None and reason.startswith("storage critical;"):
+        try:
+            payload = source_get()
+            attempted, _ = collection_timestamps(api_get, repository, workflow, branch)
+            if (not collection_in_progress(payload) and storage_blocker(payload) == reason and
+                (attempted is None or (now or boundary) - attempted >= timedelta(minutes=RETRY_COOLDOWN_MINUTES))):
+                due = maintenance_only = True
+                reason = "storage critical; dispatching verified maintenance only, with collection and scan disabled"
+        except Exception:
+            return False, "storage critical and idle history unavailable; maintenance dispatch deferred"
     if due:
+        inputs = {"recovery": "true", "cycle_key": format_cycle_key(boundary)}
+        if maintenance_only:
+            inputs["maintenance_only"] = "true"
         api_request(
             f"/repos/{repository}/actions/workflows/{workflow}/dispatches",
             method="POST",
             payload={
                 "ref": branch,
-                "inputs": {
-                    "recovery": "true",
-                    "cycle_key": format_cycle_key(boundary),
-                },
+                "inputs": inputs,
             },
         )
     return due, reason
@@ -328,6 +389,7 @@ def main() -> int:
             boundary,
             now=now,
             source_get=source_get,
+            exclude_run_id=int(os.environ["GITHUB_RUN_ID"]) if os.environ.get("GITHUB_RUN_ID") else None,
         )
     print(f"Scheduler cycle {cycle_key} due: {str(due).lower()} ({reason}).")
     if args.github_output:

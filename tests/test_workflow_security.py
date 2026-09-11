@@ -71,10 +71,15 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("--source nba-stats", freshness)
 
     def test_hosted_collectors_refresh_identity_after_maintenance(self):
-        maintenance_offset = self.collect.index("Enforce bounded storage maintenance")
+        maintenance = job_block(self.workflow, "maintain-storage", "cadence-gate")
+        self.assertIn("Enforce bounded storage maintenance", maintenance)
+        self.assertNotIn("continue-on-error", maintenance)
+        self.assertIn("python scripts/maintain_storage.py", maintenance)
+        gate = job_block(self.workflow, "cadence-gate", "keepalive")
+        self.assertIn("inputs.maintenance_only != true", gate)
+        self.assertIn("needs: maintain-storage", self.workflow)
         refresh_offset = self.collect.index("Refresh identity after storage maintenance")
         hosted_offset = self.collect.index("Refresh hosted decision feeds")
-        self.assertLess(maintenance_offset, refresh_offset)
         self.assertLess(refresh_offset, hosted_offset)
         hosted_block = self.collect[hosted_offset:self.collect.index(
             "Refresh official NBA injury availability"
@@ -96,7 +101,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         )
         scan_offset = self.final.index("Run one verified Crypto paper scan")
         sentinel_offset = self.final.index(
-            "Surface an unassessable NBA attestation"
+            "Surface stale decision inputs"
         )
         self.assertLess(freshness_offset, scan_offset)
         self.assertLess(scan_offset, sentinel_offset)
