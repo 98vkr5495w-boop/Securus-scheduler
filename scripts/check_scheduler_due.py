@@ -269,19 +269,29 @@ def recover_cycle(
         api_get, repository, workflow, branch, boundary, now=now, source_get=source_get
     )
     maintenance_only = False
-    # Critical storage never authorizes collection. The same trusted workflow
-    # has a separate maintenance-only mode; its cadence/collection/scan jobs
-    # cannot run. Observe the same known-idle history and repair cooldown.
-    if not due and source_get is not None and reason.startswith("storage critical;"):
+    # Also drain WARNING storage while feeds are fresh: a green feed check must
+    # not starve preventive cleanup. Overdue feeds retain priority below the
+    # critical boundary. Neither path changes collection cadence or admission.
+    if not due and source_get is not None:
         try:
             payload = source_get()
-            attempted, _ = collection_timestamps(api_get, repository, workflow, branch)
-            if (not collection_in_progress(payload) and storage_blocker(payload) == reason and
-                (attempted is None or (now or boundary) - attempted >= timedelta(minutes=RETRY_COOLDOWN_MINUTES))):
-                due = maintenance_only = True
-                reason = "storage critical; dispatching verified maintenance only, with collection and scan disabled"
+            blocker = storage_blocker(payload)
+            capacity = (payload.get("storage") or {}).get("capacity") or {}
+            critical = reason.startswith("storage critical;") and blocker == reason
+            warning = (blocker is None and capacity.get("capacityState") == "WARNING"
+                       and 75 <= capacity.get("utilizationPercent", -1) < 85
+                       and not source_refresh_due(payload, now or boundary))
+            if critical or warning:
+                # Recheck actual job history even if the first gate returned
+                # early for fresh feeds, unknown history or a pending runtime.
+                attempted, _ = collection_timestamps(api_get, repository, workflow, branch)
+                if (not collection_in_progress(payload) and
+                    (attempted is None or (now or boundary) - attempted >= timedelta(minutes=RETRY_COOLDOWN_MINUTES))):
+                    due = maintenance_only = True
+                    level = "critical" if critical else "warning"
+                    reason = f"storage {level}; dispatching verified maintenance only, with collection and scan disabled"
         except Exception:
-            return False, "storage critical and idle history unavailable; maintenance dispatch deferred"
+            return False, "storage maintenance prerequisites unavailable; maintenance dispatch deferred, not confirmed healthy"
     if due:
         inputs = {"recovery": "true", "cycle_key": format_cycle_key(boundary)}
         if maintenance_only:

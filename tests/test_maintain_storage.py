@@ -36,6 +36,17 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not reach"):
             self.run_fake([84.8], max_passes=1)
 
+    def test_preventive_cleanup_continues_below_collection_headroom(self):
+        result, calls = self.run_fake([83.4, 80, 74], target=74)
+        self.assertEqual(result["capacity"]["utilizationPercent"], 74)
+        self.assertEqual(sum(body is not None for _, body in calls), 3)
+        self.assertTrue(all(path.startswith(("/api/data-sources", "/api/storage-maintenance"))
+                            for path, _ in calls))
+
+    def test_preventive_cleanup_cannot_claim_success_before_target(self):
+        with self.assertRaisesRegex(RuntimeError, "did not reach 74"):
+            self.run_fake([83.4, 80], target=74, max_passes=2)
+
     def test_stagnant_cleanup_stops_before_exhausting_budget(self):
         with self.assertRaisesRegex(RuntimeError, "no capacity progress"):
             self.run_fake([85.2, 85.2, 85.2])

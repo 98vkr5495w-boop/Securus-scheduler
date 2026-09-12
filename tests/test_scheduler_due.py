@@ -101,6 +101,52 @@ class SchedulerDueTests(unittest.TestCase):
             now=now, source_get=lambda: self.sources(now, 60), exclude_run_id=42)
         self.assertTrue(due)
 
+    def test_warning_storage_gets_maintenance_even_with_fresh_feeds(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 5)
+        state["storage"]["capacity"] = {"capacityState": "WARNING", "utilizationPercent": 83.8}
+        calls = []
+        due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertTrue(due)
+        self.assertIn("storage warning", reason)
+        self.assertEqual(calls[0]["payload"]["inputs"]["maintenance_only"], "true")
+        self.assertEqual(len(calls), 1)
+
+    def test_warning_cleanup_never_displaces_due_collection(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 45)
+        state["storage"]["capacity"] = {"capacityState": "WARNING", "utilizationPercent": 83.8}
+        calls = []
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertTrue(due)
+        self.assertNotIn("maintenance_only", calls[0]["payload"]["inputs"])
+
+    def test_warning_cleanup_retains_cooldown_and_known_idle_requirements(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 5)
+        state["storage"]["capacity"] = {"capacityState": "WARNING", "utilizationPercent": 83.8}
+        def pending(path):
+            return {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "schedule", "status": "in_progress"}]}
+        recent = fake_api(job_name="maintain-storage", started_at=(now-timedelta(minutes=2)).isoformat())
+        for api in [recent, pending, lambda _: {}]:
+            calls = []
+            due, _ = recover_cycle(api, lambda *a, **kw: calls.append(kw),
+                "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+                source_get=lambda: state)
+            self.assertFalse(due)
+            self.assertEqual(calls, [])
+        state["sources"][0]["lastRun"]["status"] = "RUNNING"
+        calls = []
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertFalse(due)
+        self.assertEqual(calls, [])
+
     def test_malformed_history_is_not_an_empty_successful_history(self):
         now = CYCLE + timedelta(hours=3)
         for history in [{}, {"workflow_runs": None}, {"workflow_runs": [{"id": 42}]}]:

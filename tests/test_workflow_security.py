@@ -75,6 +75,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("Enforce bounded storage maintenance", maintenance)
         self.assertNotIn("continue-on-error", maintenance)
         self.assertIn("python scripts/maintain_storage.py", maintenance)
+        self.assertIn("--target-percent ${{ inputs.maintenance_only && '74' || '83.5' }}", maintenance)
         gate = job_block(self.workflow, "cadence-gate", "keepalive")
         self.assertIn("inputs.maintenance_only != true", gate)
         self.assertIn("needs: maintain-storage", self.workflow)

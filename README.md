@@ -39,6 +39,18 @@ The prepared [external recovery Worker](external/README.md) supplies a separate
 ten-minute timer after account deployment and secure credential setup. Its
 presence in this repository is not proof that independent delivery is active.
 
+Storage cleanup is automatic before and after ordinary collection. In addition,
+the watchdog dispatches the existing storage-only workflow when storage is in
+WARNING and feeds are still fresh. This dedicated cleanup targets 74% utilization,
+below the unchanged 75% warning boundary, instead of stopping at the ordinary
+83.5% collection-admission target. Due collection retains priority below the
+unchanged 85% critical boundary; critical storage permits only maintenance.
+The storage-only mode cannot collect or scan paper bets. Both paths retain the
+known-idle check, ten-minute attempt cooldown, four-minute/12-pass cleanup budget,
+stagnation stop and verified archival/deletion protections. An incomplete drain
+is reported as incomplete, never healthy; later eligible checks can continue it.
+This remains dependent on GitHub delivery until the separate timer is activated.
+
 Official NBA injury-report availability is independently checked on a separate
 runner job with no OIDC capability. That job downloads only the exact NBA PDF
 named by Securus, verifies its byte count and SHA-256 digest, and uses Poppler's

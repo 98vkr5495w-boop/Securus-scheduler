@@ -91,7 +91,9 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Enforce bounded storage maintenance
-        run: python scripts/maintain_storage.py
+        # Dedicated cleanup targets below WARNING; normal collection keeps its
+        # existing admission headroom and does not wait for full backlog drain.
+        run: python scripts/maintain_storage.py --target-percent ${{ inputs.maintenance_only && '74' || '83.5' }}
 
   cadence-gate:
     needs: maintain-storage
