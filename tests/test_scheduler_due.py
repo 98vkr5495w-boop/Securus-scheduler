@@ -283,9 +283,36 @@ class SchedulerDueTests(unittest.TestCase):
         self.assertEqual(dispatched, [])
 
     def sources(self, now, age=0):
-        return {"storage": {"capacity": {"capacityState": "NORMAL", "utilizationPercent": 50}}, "sources": [{"id": source, "lastRun": {
+        return {"lastPaperScan": {"runId": "completed-test-scan", "mode": "PAPER_ONLY", "completedAt": format_cycle_key(now)},
+                "storage": {"capacity": {"capacityState": "NORMAL", "utilizationPercent": 50}}, "sources": [{"id": source, "lastRun": {
             "status": "SUCCEEDED", "completedAt": format_cycle_key(now - timedelta(minutes=age)),
         }} for source in FREQUENT_SOURCES | DEEP_SOURCES]}
+
+    def test_fresh_feeds_cannot_hide_a_missing_or_stalled_paper_scan(self):
+        now = CYCLE + timedelta(hours=3)
+        for scan in [None, {}, {"runId": "old", "mode": "PAPER_ONLY", "completedAt": format_cycle_key(now - timedelta(minutes=61))}]:
+            state = self.sources(now, 5)
+            state["lastPaperScan"] = scan
+            calls = []
+            due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+                "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+                source_get=lambda: state)
+            self.assertTrue(due)
+            self.assertIn("completed paper scan", reason)
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("maintenance_only", calls[0]["payload"]["inputs"])
+
+    def test_missing_scan_recovery_retains_cooldown(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 5)
+        state["lastPaperScan"] = None
+        calls = []
+        due, reason = recover_cycle(fake_api(started_at=format_cycle_key(now - timedelta(minutes=2))),
+            lambda *a, **kw: calls.append(kw), "owner/repo", "securus-scheduler.yml", "main",
+            cycle_start(now), now=now, source_get=lambda: state)
+        self.assertFalse(due)
+        self.assertIn("cooldown", reason)
+        self.assertEqual(calls, [])
 
     def test_actual_sources_not_a_green_workflow_determine_refresh(self):
         now = CYCLE + timedelta(minutes=70)

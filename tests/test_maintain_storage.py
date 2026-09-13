@@ -8,6 +8,34 @@ def capacity(percent):
 
 
 class MaintenanceTests(unittest.TestCase):
+    def test_lease_journal_handoff_waits_for_an_exact_verified_run(self):
+        posts, sleeps = [], []
+        def api(path, payload=None):
+            if path == "/api/data-sources":
+                return {"storage": {"capacity": capacity(75)}}
+            if payload is not None:
+                posts.append(payload)
+                return ({"accepted": True, "alreadyRunning": True, "status": "RUNNING", "runId": None}
+                        if len(posts) == 1 else {"accepted": True, "runId": 42})
+            self.assertEqual(path, "/api/storage-maintenance-status?runId=42")
+            return {"runId": 42, "status": "SUCCEEDED", "completedAt": "2026-09-13T16:00:00Z", "capacity": capacity(74)}
+        result = maintain(api, sleep=sleeps.append, clock=lambda: 0)
+        self.assertEqual(result["runId"], 42)
+        self.assertEqual(sleeps, [2])
+        self.assertEqual(len(posts), 2)
+
+    def test_missing_journal_cannot_retry_forever_or_claim_success(self):
+        posts, sleeps = [], []
+        def api(path, payload=None):
+            if payload is None:
+                return {"storage": {"capacity": capacity(75)}}
+            posts.append(payload)
+            return {"accepted": True, "alreadyRunning": True, "status": "RUNNING", "runId": None}
+        with self.assertRaisesRegex(RuntimeError, "durable run ID"):
+            maintain(api, sleep=sleeps.append, clock=lambda: 0)
+        self.assertEqual(len(posts), 4)
+        self.assertEqual(sleeps, [2, 2, 2])
+
     def run_fake(self, percents, statuses=(), **kwargs):
         calls, running = [], list(statuses)
         remaining = iter(percents)

@@ -164,7 +164,16 @@ def deep_refresh_due(payload: dict[str, Any], now: datetime) -> bool:
 
 def source_refresh_due(payload: dict[str, Any], now: datetime) -> bool:
     """Use completed feed timestamps, never a workflow or paper-scan receipt."""
-    return sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES) or deep_refresh_due(payload, now)
+    return (sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES)
+            or deep_refresh_due(payload, now) or paper_scan_due(payload, now))
+
+
+def paper_scan_due(payload: dict[str, Any], now: datetime) -> bool:
+    scan = payload.get("lastPaperScan")
+    if not isinstance(scan, dict) or scan.get("mode") != "PAPER_ONLY" or not scan.get("runId"):
+        return True
+    completed = parse_timestamp(scan.get("completedAt"))
+    return completed is None or not timedelta(0) <= now - completed < timedelta(minutes=60)
 
 
 def read_public_source_status() -> dict[str, Any]:
@@ -226,6 +235,8 @@ def scheduler_is_due(
                 reason = "a frequent feed is missing, failed, or due for its 30-minute refresh"
             elif deep_refresh_due(payload, now):
                 reason = "a deep-stat feed is missing, failed, or due for its six-hour refresh"
+            elif paper_scan_due(payload, now):
+                reason = "a completed paper scan is missing or older than 60 minutes; full guarded recovery is due"
             else:
                 return False, "frequent feeds are under 30 minutes old and deep feeds are within their six-hour cadence"
         except Exception:
