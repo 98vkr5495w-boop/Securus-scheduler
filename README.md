@@ -27,9 +27,29 @@ If GitHub collection history is unavailable too, recovery defers to the next
 check rather than repeatedly dispatching with an unknown cooldown. That state
 does not claim the feeds are healthy; Securus keeps stale decisions fail-closed.
 
+GitHub's cron delivery for this repository is best-effort and has been observed
+to degrade sharply: 48 scheduled scheduler runs per day (a perfect two per hour)
+on 2026-09-06 through 2026-09-08 fell to 10 to 15 per day from 2026-09-10, and
+the watchdog fell from 48 per day to 7 per day even after its cron was raised
+to six per hour. That degradation began around 13:00 UTC on 2026-09-09 with no
+repository change, so it is a platform-side throttle that no workflow edit can
+repair. The chained completion checks below recover single missed slots; only
+the prepared external recovery timer removes the dependence on GitHub cron.
+
+Every cadence-gate result is classified (`gate_state`): `DUE`, `FRESH`
+(feeds under 30 minutes old), `PENDING` (another trusted runtime already owns
+the cycle), or `DEFERRED`. A deferred cycle leaves feeds stale, so the gate
+fails the run visibly instead of reporting a green skip. A RUNNING collector
+receipt counts as "in progress" only while it is younger than the 20-minute
+lease horizon and only for the decision feeds the gate depends on; an older or
+unverifiable receipt is an abandoned worker and recovery proceeds.
+
 Scheduled and recovery scans derive a UUIDv4 request ID from the repository ID
 and the canonical UTC `:07`/`:37` cycle key. Delayed triggers are promoted to the
-current cycle rather than replaying an obsolete scan. If status checks race or a recovery is duplicated, Securus's
+current cycle rather than replaying an obsolete scan. The paper scan now executes inside Securus's bounded request and its status
+poll outlasts Securus's abandonment horizon, so a dead worker is reported as
+`RUN_TIMED_OUT` rather than an ambiguous verification failure; public logs carry
+only that coarse category, never markets or decision reasons. If status checks race or a recovery is duplicated, Securus's
 durable run journal returns the existing result instead of executing the same
 scan twice. The cadence gate and shared scheduler concurrency limit redundant
 collection writes. Both workflows still share GitHub as a provider, so the
@@ -45,6 +65,10 @@ WARNING and feeds are still fresh. This dedicated cleanup targets 74% utilizatio
 below the unchanged 75% warning boundary, instead of stopping at the ordinary
 83.5% collection-admission target. Due collection retains priority below the
 unchanged 85% critical boundary; critical storage permits only maintenance.
+In addition, every completed collection cycle runs one bounded dedicated drain
+toward the same 74% target while storage is in WARNING and feeds are fresh, so
+cleanup no longer waits for a watchdog cron that GitHub may not deliver; an
+incomplete drain is annotated as a warning, never reported as healthy.
 The storage-only mode cannot collect or scan paper bets. Both paths retain the
 known-idle check, ten-minute attempt cooldown, four-minute/12-pass cleanup budget,
 stagnation stop and verified archival/deletion protections. An incomplete drain

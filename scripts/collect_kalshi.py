@@ -190,14 +190,20 @@ def post_batches(kind: str, records: list[dict[str, Any]]) -> None:
         post_json("/api/data-ingest", {"kind": kind, "records": records[index : index + 400]})
 
 
-def sync_run(status: str, records_written: int, started_at: str, error: str | None = None) -> None:
+def sync_run(
+    status: str,
+    records_written: int,
+    started_at: str,
+    error: str | None = None,
+    source_id: str = SOURCE_ID,
+) -> None:
     post_json(
         "/api/data-ingest",
         {
             "kind": "sync-run",
             "records": [
                 {
-                    "sourceId": SOURCE_ID,
+                    "sourceId": source_id,
                     "status": status,
                     "recordsWritten": records_written,
                     "startedAt": started_at,
@@ -914,7 +920,15 @@ def main() -> int:
             print(json.dumps(result))
             return 0
         except Exception as error:
-            print(str(error)[:500], file=sys.stderr)
+            message = str(error)[:500]
+            # A relay that times out or is rejected must leave a terminal
+            # receipt; otherwise the Site's own RUNNING journal is the only
+            # evidence and freshness stays unverifiable until it expires.
+            try:
+                sync_run("FAILED", 0, started_at, message, source_id="climate")
+            except Exception as sync_error:
+                message = f"{message}; sync reporting failed: {sync_error}"
+            print(message, file=sys.stderr)
             return 1
     if requested_sport in ("", "ALL"):
         sports = list(SERIES)

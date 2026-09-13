@@ -108,6 +108,7 @@ jobs:
     outputs:
       should_run: ${{ steps.due.outputs.should_run }}
       cycle_key: ${{ steps.due.outputs.cycle_key }}
+      gate_state: ${{ steps.due.outputs.gate_state }}
       deep_sources_due: ${{ steps.due.outputs.deep_sources_due }}
     steps:
       - name: Check out scheduler
@@ -125,6 +126,7 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$RECOVERY" != "true" ]]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "gate_state=DUE" >> "$GITHUB_OUTPUT"
             echo "Explicit manual run bypasses the recovery cadence gate."
           else
             cycle_args=()
@@ -140,6 +142,17 @@ jobs:
               "${cycle_args[@]}" \
               --github-output "$GITHUB_OUTPUT"
           fi
+
+      - name: Surface a deferred cycle that left feeds stale
+        # A green skip is only honest when feeds are fresh or another trusted
+        # runtime owns the cycle. Deferral (abandoned receipt, unavailable
+        # status, cooldown after a failed attempt, critical storage) must be
+        # visible as a failed run; the watchdog keeps its own bounded recovery.
+        if: steps.due.outputs.should_run != 'true' && steps.due.outputs.gate_state == 'DEFERRED'
+        shell: bash
+        run: |
+          echo "::error::Scheduler cycle ${{ steps.due.outputs.cycle_key }} was deferred without refreshing decision feeds; see the freshness check above."
+          exit 1
 
   keepalive:
     if: github.event_name == 'schedule' && github.event.schedule == '23 5 1,15 * *'
@@ -438,6 +451,32 @@ jobs:
         run: |
           echo "::error::Decision-input freshness did not pass after bounded status rechecks; inspect the freshness step for source times."
           exit 1
+
+      - name: Drain WARNING storage while feeds are fresh
+        # Cleanup keeps pace only if a dedicated pass runs every cycle, not only
+        # when GitHub happens to deliver a watchdog cron. This bounded pass
+        # targets the same 74% as maintenance-only recovery. It cannot collect
+        # or scan, cannot fail a completed cycle, and reports an incomplete
+        # drain as a visible warning instead of a green result.
+        if: always() && steps.freshness.outcome == 'success'
+        id: drain
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=$(curl --silent --show-error --max-time 20 -H "Accept: application/json" \
+            -H "Cache-Control: no-cache" "$SECURUS_URL/api/data-sources" \
+            | jq -r '.storage.capacity | select(.capacityState == "WARNING" and .utilizationPercent >= 75 and .utilizationPercent < 85) | "WARNING"' 2>/dev/null || true)
+          if [[ "$status" != "WARNING" ]]; then
+            echo "Storage is not in WARNING; no dedicated drain this cycle."
+            exit 0
+          fi
+          if python scripts/maintain_storage.py --target-percent 74; then
+            echo "Dedicated cleanup reached its 74% target."
+          else
+            echo "::warning::Dedicated storage drain did not reach 74% within its bounded budget; the next cycle continues it."
+            exit 1
+          fi
 
       - name: Surface an unassessable NBA attestation after the scan
         if: >-
