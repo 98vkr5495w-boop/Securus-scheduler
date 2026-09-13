@@ -82,11 +82,22 @@ def maintain(api=request, *, target=83.5, max_passes=MAX_PASSES,
     for attempt in range(max_passes):
         if clock() >= deadline:
             break
-        accepted = api("/api/storage-maintenance", {
-            "triggerName": "public-github-actions-verified", "maxArchives": 12,
-        })
-        run_id = accepted.get("runId")
-        if accepted.get("accepted") is not True or type(run_id) is not int or run_id <= 0:
+        for admission in range(4):
+            if clock() >= deadline:
+                raise RuntimeError("Maintenance admission is pending; collection blocked")
+            accepted = api("/api/storage-maintenance", {
+                "triggerName": "public-github-actions-verified", "maxArchives": 12,
+            })
+            run_id = accepted.get("runId")
+            if accepted.get("accepted") is True and type(run_id) is int and run_id > 0:
+                break
+            # A post-ingest worker can finish its journal just before releasing
+            # its lease, or hold the lease before inserting the journal. Retry
+            # only that explicit handoff, still inside the original time budget.
+            if (accepted.get("accepted") is True and accepted.get("alreadyRunning") is True
+                and accepted.get("status") == "RUNNING" and run_id is None and admission < 3):
+                sleep(2)
+                continue
             raise RuntimeError("Maintenance was not accepted with a durable run ID")
         # POST.after is explicitly a BEFORE measurement. Never trust it or a
         # server-supplied status URL. Poll this exact run on the pinned Site.
