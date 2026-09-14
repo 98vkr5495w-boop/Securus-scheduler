@@ -79,6 +79,21 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no capacity progress"):
             self.run_fake([85.2, 85.2, 85.2])
 
+    def test_verified_deletions_under_concurrent_ingest_are_not_stagnation(self):
+        # Measured bytes can stay flat while post-ingest writes land between
+        # passes; a pass that verifiably deleted rows is progress.
+        calls, remaining = [], iter([85.2, 85.2, 85.2, 85.2, 84.9, 83.4])
+        def api(path, payload=None):
+            calls.append(path)
+            if path == "/api/data-sources":
+                return {"storage": {"capacity": capacity(85.2)}}
+            if payload is not None:
+                return {"accepted": True, "runId": 42}
+            return {"runId": 42, "status": "SUCCEEDED", "completedAt": "2026-09-13T16:00:00Z",
+                    "rowsDeleted": 250, "capacity": capacity(next(remaining))}
+        result = maintain(api, sleep=lambda _: None, clock=lambda: 0)
+        self.assertEqual(result["capacity"]["utilizationPercent"], 83.4)
+
     def test_unknown_storage_blocks_even_maintenance(self):
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
             maintain(lambda _: {}, clock=lambda: 0)

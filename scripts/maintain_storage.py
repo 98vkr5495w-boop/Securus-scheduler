@@ -118,10 +118,16 @@ def maintain(api=request, *, target=83.5, max_passes=MAX_PASSES,
         else:
             raise RuntimeError(f"Maintenance #{run_id} is pending; collection blocked")
         state, percent, actual = capacity(result.get("capacity"))
-        print(f"Verified maintenance #{run_id}: {percent:.2f}% storage (pass {attempt + 1}/{max_passes}).", flush=True)
+        rows_deleted = result.get("rowsDeleted")
+        deleted = rows_deleted if type(rows_deleted) is int and rows_deleted >= 0 else 0
+        print(f"Verified maintenance #{run_id}: {percent:.2f}% storage, {deleted} rows deleted "
+              f"(pass {attempt + 1}/{max_passes}).", flush=True)
         if state != "CRITICAL" and percent <= target:
             return result
-        stagnant = stagnant + 1 if actual >= previous_bytes else 0
+        # Concurrent ingestion can hold the measured size flat while a pass
+        # genuinely deletes rows; judge stagnation by the run's own verified
+        # deletions first, and by measured bytes only when it deleted nothing.
+        stagnant = 0 if deleted > 0 else stagnant + 1 if actual >= previous_bytes else 0
         if stagnant >= 3:
             raise RuntimeError("Three verified maintenance passes made no capacity progress; collection blocked")
         previous_bytes = actual

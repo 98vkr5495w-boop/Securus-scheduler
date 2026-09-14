@@ -19,9 +19,15 @@ COLLECT_JOB_NAME = "collect-inputs"
 SCHEDULE_OFFSET_MINUTES = 7
 REFRESH_MINUTES = 30
 RETRY_COOLDOWN_MINUTES = 10
+# Securus projects a collector journal as abandoned 15 minutes after its start
+# when no live lease remains, and unconditionally after 30 minutes. A RUNNING
+# receipt older than this can never be a live worker; treating it as "in
+# progress" would defer recovery forever (observed 2026-09-13, ~15 hours).
+ABANDONED_COLLECTION_MINUTES = 20
 PUBLIC_SOURCE_URL = "https://edgelab-sports.jkv9c8bzjn.chatgpt.site/api/data-sources"
 FREQUENT_SOURCES = frozenset({"mlb-stats-api", "action-network", "sleeper-nfl", "kalshi", "open-meteo", "climate"})
 DEEP_SOURCES = frozenset({"nflverse", "baseball-savant"})
+GATED_SOURCES = FREQUENT_SOURCES | DEEP_SOURCES
 
 
 def parse_timestamp(value: object) -> datetime | None:
@@ -132,10 +138,60 @@ def storage_blocker(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def collection_in_progress(payload: dict[str, Any]) -> bool:
-    return any(isinstance(row, dict) and isinstance(row.get("lastRun"), dict) and
-               row["lastRun"].get("status") in ("RUNNING", "QUEUED", "IN_PROGRESS")
-               for row in payload.get("sources", []))
+def collection_in_progress(payload: dict[str, Any], now: datetime | None = None) -> bool:
+    """True only for a RUNNING receipt young enough to still be a live worker.
+
+    A receipt without a parseable start, or one older than the abandonment
+    window, is a dead journal: it must not suppress recovery. Securus's own
+    lease rejects a genuinely overlapping collection with HTTP 409.
+    """
+    now = now or datetime.now(timezone.utc)
+    for row in payload.get("sources", []) or []:
+        run = row.get("lastRun") if isinstance(row, dict) else None
+        if not isinstance(run, dict) or run.get("status") not in ("RUNNING", "QUEUED", "IN_PROGRESS"):
+            continue
+        # Only the feeds this gate depends on can defer it. Bookkeeping rows
+        # such as the Site's own recovery marker are not collection evidence.
+        if row.get("id") not in GATED_SOURCES:
+            continue
+        started = parse_timestamp(run.get("startedAt"))
+        if started is None:
+            continue
+        if timedelta(0) <= now - started < timedelta(minutes=ABANDONED_COLLECTION_MINUTES):
+            return True
+    return False
+
+
+def abandoned_collections(payload: dict[str, Any], now: datetime | None = None) -> list[str]:
+    """Source IDs whose latest receipt is RUNNING but too old or unverifiable to be live."""
+    now = now or datetime.now(timezone.utc)
+    abandoned = []
+    for row in payload.get("sources", []) or []:
+        run = row.get("lastRun") if isinstance(row, dict) else None
+        if not isinstance(run, dict) or run.get("status") not in ("RUNNING", "QUEUED", "IN_PROGRESS"):
+            continue
+        if row.get("id") not in GATED_SOURCES:
+            continue
+        started = parse_timestamp(run.get("startedAt"))
+        if started is None or not timedelta(0) <= now - started < timedelta(minutes=ABANDONED_COLLECTION_MINUTES):
+            abandoned.append(str(row.get("id")))
+    return sorted(abandoned)
+
+
+def gate_state(due: bool, reason: str) -> str:
+    """Classify a gate outcome so a skipped cycle cannot masquerade as healthy.
+
+    DUE: collection dispatches or proceeds. FRESH: nothing is due. PENDING:
+    another trusted runtime already owns this cycle. DEFERRED: feeds are stale
+    or unverifiable and nothing will refresh them in this run.
+    """
+    if due:
+        return "DUE"
+    if reason.startswith("frequent feeds are under") or reason.startswith("cycle ") and "completed at" in reason:
+        return "FRESH"
+    if "already queued or in progress" in reason:
+        return "PENDING"
+    return "DEFERRED"
 
 
 def sources_due(payload: dict[str, Any], now: datetime, sources: frozenset[str], minutes: int) -> bool:
@@ -226,12 +282,17 @@ def scheduler_is_due(
     if source_get is not None:
         try:
             payload = source_get()
-            if collection_in_progress(payload):
+            if collection_in_progress(payload, now):
                 return False, "a runtime source collection is unfinished; recovery deferred"
+            abandoned = abandoned_collections(payload, now)
             blocker = storage_blocker(payload)
             if blocker:
                 return False, blocker
-            if sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES):
+            if abandoned:
+                reason = ("an abandoned collector receipt is older than the "
+                          f"{ABANDONED_COLLECTION_MINUTES}-minute lease horizon ({', '.join(abandoned)}); "
+                          "fresh collection is required")
+            elif sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES):
                 reason = "a frequent feed is missing, failed, or due for its 30-minute refresh"
             elif deep_refresh_due(payload, now):
                 reason = "a deep-stat feed is missing, failed, or due for its six-hour refresh"
@@ -296,7 +357,7 @@ def recover_cycle(
                 # Recheck actual job history even if the first gate returned
                 # early for fresh feeds, unknown history or a pending runtime.
                 attempted, _ = collection_timestamps(api_get, repository, workflow, branch)
-                if (not collection_in_progress(payload) and
+                if (not collection_in_progress(payload, now or boundary) and
                     (attempted is None or (now or boundary) - attempted >= timedelta(minutes=RETRY_COOLDOWN_MINUTES))):
                     due = maintenance_only = True
                     level = "critical" if critical else "warning"
@@ -412,11 +473,17 @@ def main() -> int:
             source_get=source_get,
             exclude_run_id=int(os.environ["GITHUB_RUN_ID"]) if os.environ.get("GITHUB_RUN_ID") else None,
         )
-    print(f"Scheduler cycle {cycle_key} due: {str(due).lower()} ({reason}).")
+    state = gate_state(due, reason)
+    print(f"Scheduler cycle {cycle_key} due: {str(due).lower()} ({reason}). Gate state: {state}.")
+    if state == "DEFERRED":
+        # A deferred cycle leaves feeds stale. Annotate it so the run cannot be
+        # mistaken for a healthy skip; the caller decides whether to fail.
+        print(f"::warning::Scheduler cycle {cycle_key} was deferred without refreshing feeds: {reason}.")
     if args.github_output:
         with Path(args.github_output).open("a", encoding="utf-8") as output:
             output.write(f"should_run={str(due).lower()}\n")
             output.write(f"cycle_key={cycle_key}\n")
+            output.write(f"gate_state={state}\n")
             deep_due = source_payload is not None and deep_refresh_due(source_payload, now)
             output.write(f"deep_sources_due={str(deep_due).lower()}\n")
     if due and args.dispatch_if_due:

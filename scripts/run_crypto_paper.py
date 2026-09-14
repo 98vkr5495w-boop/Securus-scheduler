@@ -22,8 +22,13 @@ from urllib.request import Request, urlopen
 import uuid
 
 
-USER_AGENT = "Securus-Crypto-Paper-Runner/2.0"
-DEFAULT_POLL_ATTEMPTS = 60
+USER_AGENT = "Securus-Crypto-Paper-Runner/2.1"
+# Securus executes the tracked scan inside the POST (bounded at 170 seconds) and
+# projects an abandoned worker as TIMED_OUT 15 minutes after its start when its
+# lease is gone, or 30 minutes after its start unconditionally. Polling must
+# outlast that horizon so a dead worker is reported as TIMED_OUT, not as an
+# ambiguous "not verified" result that hides the cause.
+DEFAULT_POLL_ATTEMPTS = 373
 DEFAULT_POLL_DELAY_SECONDS = 5
 NONTERMINAL_STATUSES = {"QUEUED", "RUNNING"}
 TERMINAL_FAILURE_STATUSES = {"FAILED", "BLOCKED", "TIMED_OUT"}
@@ -333,6 +338,26 @@ def run_and_verify(
     }
 
 
+def failure_category(error: Exception) -> str:
+    """A coarse, non-diagnostic category for public logs; never decision detail."""
+    message = str(error)
+    if message.startswith("Crypto paper run TIMED_OUT"):
+        return "RUN_TIMED_OUT"
+    if message.startswith("Crypto paper run FAILED"):
+        return "RUN_FAILED"
+    if message.startswith("Crypto paper run BLOCKED"):
+        return "RUN_BLOCKED"
+    if "was not verified after" in message:
+        return "RUN_NOT_TERMINAL"
+    if message.startswith("Crypto paper scan verification failed") or \
+            message.startswith("Crypto paper run verification failed") or \
+            "out of order" in message or "completed before it started" in message:
+        return "RESULT_INVALID"
+    if message.startswith("HTTP "):
+        return "REQUEST_REJECTED"
+    return "TRANSPORT"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
@@ -363,10 +388,15 @@ def main() -> int:
                 if args.request_key else None
             ),
         )
-    except Exception:
+    except Exception as error:
         # The public scheduler log is deliberately non-diagnostic. Detailed
-        # lifecycle and decision evidence stays inside private Securus telemetry.
-        print("Securus paper scan failed verification.", file=sys.stderr)
+        # lifecycle and decision evidence stays inside private Securus telemetry;
+        # only a coarse category is surfaced so operators can tell a dead worker
+        # from a rejected request without exposing markets or reasons.
+        print(
+            f"Securus paper scan failed verification (category: {failure_category(error)}).",
+            file=sys.stderr,
+        )
         return 1
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

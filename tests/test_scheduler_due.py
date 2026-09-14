@@ -15,6 +15,10 @@ from scripts.check_scheduler_due import (
     FREQUENT_SOURCES,
     DEEP_SOURCES,
     deep_refresh_due,
+    collection_in_progress,
+    abandoned_collections,
+    gate_state,
+    ABANDONED_COLLECTION_MINUTES,
 )
 
 
@@ -88,7 +92,7 @@ class SchedulerDueTests(unittest.TestCase):
         due, _ = recover_cycle(api, lambda *a, **kw: calls.append(kw), "owner/repo",
             "securus-scheduler.yml", "main", cycle_start(now), now=now, source_get=lambda: state)
         self.assertFalse(due)
-        state["sources"][0]["lastRun"]["status"] = "RUNNING"
+        state["sources"][0]["lastRun"] = {"status": "RUNNING", "startedAt": format_cycle_key(now - timedelta(minutes=2))}
         due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw), "owner/repo",
             "securus-scheduler.yml", "main", cycle_start(now), now=now, source_get=lambda: state)
         self.assertFalse(due)
@@ -139,13 +143,74 @@ class SchedulerDueTests(unittest.TestCase):
                 source_get=lambda: state)
             self.assertFalse(due)
             self.assertEqual(calls, [])
-        state["sources"][0]["lastRun"]["status"] = "RUNNING"
+        state["sources"][0]["lastRun"] = {"status": "RUNNING", "startedAt": format_cycle_key(now - timedelta(minutes=2))}
         calls = []
         due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
             "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
             source_get=lambda: state)
         self.assertFalse(due)
         self.assertEqual(calls, [])
+
+    def test_abandoned_running_receipts_cannot_defer_recovery_forever(self):
+        # 2026-09-13: one RUNNING receipt deferred every scheduled and watchdog
+        # check for ~15 hours. A dead journal must be bounded, never a live worker.
+        now = CYCLE + timedelta(hours=3)
+        for started in [format_cycle_key(now - timedelta(minutes=ABANDONED_COLLECTION_MINUTES)),
+                        format_cycle_key(now - timedelta(hours=15)), None, "", "not-a-time",
+                        format_cycle_key(now + timedelta(minutes=5))]:
+            with self.subTest(started=started):
+                state = self.sources(now, 5)
+                state["sources"][0]["lastRun"] = {"status": "RUNNING", "startedAt": started}
+                self.assertFalse(collection_in_progress(state, now))
+                self.assertEqual(abandoned_collections(state, now), [state["sources"][0]["id"]])
+                calls = []
+                due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+                    "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+                    source_get=lambda: state)
+                self.assertTrue(due)
+                self.assertIn("abandoned collector receipt", reason)
+                self.assertIn(state["sources"][0]["id"], reason)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("maintenance_only", calls[0]["payload"]["inputs"])
+        marker = self.sources(now, 5)
+        marker["sources"].append({"id": "site-cron-recovery", "lastRun": {"status": "RUNNING",
+            "startedAt": format_cycle_key(now - timedelta(minutes=1))}})
+        self.assertFalse(collection_in_progress(marker, now),
+            "a Site bookkeeping row is not collection evidence and cannot defer the gate")
+        self.assertEqual(abandoned_collections(marker, now), [])
+        due, reason = scheduler_is_due(fake_api(), "owner/repo", "securus-scheduler.yml", "main",
+            cycle_start(now), now=now, source_get=lambda: marker)
+        self.assertFalse(due)
+        self.assertIn("frequent feeds are under", reason)
+        live = self.sources(now, 5)
+        live["sources"][0]["lastRun"] = {"status": "RUNNING",
+            "startedAt": format_cycle_key(now - timedelta(minutes=ABANDONED_COLLECTION_MINUTES - 1))}
+        self.assertTrue(collection_in_progress(live, now))
+        self.assertEqual(abandoned_collections(live, now), [])
+        due, reason = scheduler_is_due(fake_api(), "owner/repo", "securus-scheduler.yml", "main",
+            cycle_start(now), now=now, source_get=lambda: live)
+        self.assertFalse(due)
+        self.assertIn("unfinished", reason)
+        stale = self.sources(now, 5)
+        stale["sources"][0]["lastRun"] = {"status": "RUNNING", "startedAt": format_cycle_key(now - timedelta(hours=1))}
+        due, reason = scheduler_is_due(fake_api(started_at=format_cycle_key(now - timedelta(minutes=2)),
+            completed_at=None, conclusion="failure"), "owner/repo", "securus-scheduler.yml", "main",
+            cycle_start(now), now=now, source_get=lambda: stale)
+        self.assertFalse(due, "an abandoned receipt still honors the bounded retry cooldown")
+        self.assertIn("cooldown", reason)
+
+    def test_gate_state_never_reports_a_deferred_stale_cycle_as_fresh(self):
+        self.assertEqual(gate_state(True, "a frequent feed is missing"), "DUE")
+        self.assertEqual(gate_state(False, "frequent feeds are under 30 minutes old and deep feeds are within their six-hour cadence"), "FRESH")
+        self.assertEqual(gate_state(False, "cycle 2026-09-03T05:07:00Z completed at 2026-09-03T05:12:00Z"), "FRESH")
+        self.assertEqual(gate_state(False, "runtime already queued or in progress"), "PENDING")
+        for reason in ["a runtime source collection is unfinished; recovery deferred",
+                       "live source timestamps and storage could not be verified; recovery deferred, not confirmed healthy",
+                       "collection history unavailable; recovery deferred to the next check, not confirmed healthy",
+                       "a frequent feed is missing, failed, or due for its 30-minute refresh; collection attempt is within the bounded 10-minute retry cooldown; readiness remains fail-closed",
+                       "storage critical; verified maintenance is required before collection",
+                       "GitHub status could not be verified; recovery deferred, not confirmed healthy"]:
+            self.assertEqual(gate_state(False, reason), "DEFERRED", reason)
 
     def test_malformed_history_is_not_an_empty_successful_history(self):
         now = CYCLE + timedelta(hours=3)
