@@ -28,7 +28,7 @@ USER_AGENT = "Securus-Crypto-Paper-Runner/2.1"
 # lease is gone, or 30 minutes after its start unconditionally. Polling must
 # outlast that horizon so a dead worker is reported as TIMED_OUT, not as an
 # ambiguous "not verified" result that hides the cause.
-DEFAULT_POLL_ATTEMPTS = 132
+DEFAULT_POLL_ATTEMPTS = 373
 DEFAULT_POLL_DELAY_SECONDS = 5
 NONTERMINAL_STATUSES = {"QUEUED", "RUNNING"}
 TERMINAL_FAILURE_STATUSES = {"FAILED", "BLOCKED", "TIMED_OUT"}

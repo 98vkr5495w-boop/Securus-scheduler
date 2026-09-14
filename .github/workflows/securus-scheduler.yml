@@ -380,7 +380,7 @@ jobs:
       needs.cadence-gate.outputs.should_run == 'true' &&
       needs.collect-inputs.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write

@@ -98,7 +98,7 @@ class DeterministicRunIdTests(unittest.TestCase):
         # A worker killed after the 202 is projected TIMED_OUT by Securus no later
         # than 30 minutes after its start; 5 minutes of polling hid that cause on
         # 2026-09-12/13 as an ambiguous "failed verification".
-        self.assertGreaterEqual(DEFAULT_POLL_ATTEMPTS * DEFAULT_POLL_DELAY_SECONDS, 11 * 60)
+        self.assertGreaterEqual((DEFAULT_POLL_ATTEMPTS - 1) * DEFAULT_POLL_DELAY_SECONDS, 31 * 60)
 
     def test_dead_worker_is_reported_as_timed_out_not_as_unverified(self):
         run_id = "59d01491-899d-4e25-9d29-2d1776e35ac0"
