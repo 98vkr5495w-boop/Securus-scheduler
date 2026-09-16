@@ -1,5 +1,5 @@
 import unittest
-from scripts.maintain_storage import maintain
+from scripts.maintain_storage import maintain, ABANDONED_MAINTENANCE_ERROR
 
 
 def capacity(percent):
@@ -35,6 +35,50 @@ class MaintenanceTests(unittest.TestCase):
             maintain(api, sleep=sleeps.append, clock=lambda: 0)
         self.assertEqual(len(posts), 4)
         self.assertEqual(sleeps, [2, 2, 2])
+
+    def test_abandoned_coalesced_worker_gets_one_fresh_verified_receipt(self):
+        posts = []
+        def api(path, payload=None):
+            if path == "/api/data-sources":
+                return {"storage": {"capacity": capacity(75)}}
+            if payload is not None:
+                posts.append(payload)
+                return {"accepted": True, "alreadyRunning": len(posts) == 1, "runId": 40 + len(posts)}
+            if path.endswith("=41"):
+                return {"runId": 41, "status": "FAILED", "error": ABANDONED_MAINTENANCE_ERROR}
+            self.assertEqual(path, "/api/storage-maintenance-status?runId=42")
+            return {"runId": 42, "status": "SUCCEEDED", "completedAt": "2026-09-16T06:50:00Z", "capacity": capacity(74)}
+        result = maintain(api, sleep=lambda _: None, clock=lambda: 0)
+        self.assertEqual(result["runId"], 42)
+        self.assertEqual(len(posts), 2)
+
+    def test_abandonment_cannot_create_an_unbounded_retry_or_exceed_pass_limit(self):
+        for limit, expected_posts in [(12, 2), (1, 1)]:
+            posts = []
+            def api(path, payload=None):
+                if path == "/api/data-sources":
+                    return {"storage": {"capacity": capacity(75)}}
+                if payload is not None:
+                    posts.append(payload)
+                    return {"accepted": True, "alreadyRunning": True, "runId": 41}
+                return {"runId": 41, "status": "FAILED", "error": ABANDONED_MAINTENANCE_ERROR}
+            with self.assertRaisesRegex(RuntimeError, "failed|did not reach"):
+                maintain(api, max_passes=limit, clock=lambda: 0)
+            self.assertEqual(len(posts), expected_posts)
+
+    def test_new_worker_failures_and_archive_integrity_errors_are_not_retried(self):
+        for coalesced, error in [(False, ABANDONED_MAINTENANCE_ERROR), (True, "archive_source_unchanged")]:
+            posts = []
+            def api(path, payload=None):
+                if path == "/api/data-sources":
+                    return {"storage": {"capacity": capacity(75)}}
+                if payload is not None:
+                    posts.append(payload)
+                    return {"accepted": True, "alreadyRunning": coalesced, "runId": 41}
+                return {"runId": 41, "status": "FAILED", "error": error}
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                maintain(api, clock=lambda: 0)
+            self.assertEqual(len(posts), 1)
 
     def run_fake(self, percents, statuses=(), **kwargs):
         calls, running = [], list(statuses)

@@ -13,6 +13,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 SITE = "https://edgelab-sports.jkv9c8bzjn.chatgpt.site"
 MAX_PASSES = 12
 TIME_BUDGET_SECONDS = 240
+ABANDONED_MAINTENANCE_ERROR = "Previous worker did not finish before its maintenance lease expired"
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -79,6 +80,7 @@ def maintain(api=request, *, target=83.5, max_passes=MAX_PASSES,
     initial = api("/api/data-sources")
     _, _, previous_bytes = capacity((initial.get("storage") or {}).get("capacity"))
     stagnant = 0
+    abandoned_retry_used = False
     for attempt in range(max_passes):
         if clock() >= deadline:
             break
@@ -99,6 +101,7 @@ def maintain(api=request, *, target=83.5, max_passes=MAX_PASSES,
                 sleep(2)
                 continue
             raise RuntimeError("Maintenance was not accepted with a durable run ID")
+        replace_abandoned = False
         # POST.after is explicitly a BEFORE measurement. Never trust it or a
         # server-supplied status URL. Poll this exact run on the pinned Site.
         for _ in range(24):
@@ -112,11 +115,25 @@ def maintain(api=request, *, target=83.5, max_passes=MAX_PASSES,
                 if not result.get("completedAt") or result.get("error"):
                     raise RuntimeError(f"Maintenance #{run_id} has invalid completion evidence")
                 break
+            if (state == "FAILED" and accepted.get("alreadyRunning") is True
+                    and result.get("error") == ABANDONED_MAINTENANCE_ERROR
+                    and not abandoned_retry_used):
+                # A coalesced post-ingest worker can expire between admission
+                # and polling. The pinned Site verifies lease expiry and no
+                # live holder before returning this exact failure. Ask normal
+                # admission for one new receipt; never delete locks, replay the
+                # old run, retry arbitrary failures, or reset the time budget.
+                abandoned_retry_used = True
+                replace_abandoned = True
+                print("Coalesced maintenance worker was abandoned; one bounded replacement admission.", flush=True)
+                break
             if state != "RUNNING":
                 raise RuntimeError(f"Maintenance #{run_id} failed ({state}); collection blocked")
             sleep(4)
         else:
             raise RuntimeError(f"Maintenance #{run_id} is pending; collection blocked")
+        if replace_abandoned:
+            continue
         state, percent, actual = capacity(result.get("capacity"))
         rows_deleted = result.get("rowsDeleted")
         deleted = rows_deleted if type(rows_deleted) is int and rows_deleted >= 0 else 0
