@@ -101,6 +101,21 @@ def collection_timestamps(
         if run.get("status") not in ("completed", "queued", "in_progress", "waiting", "pending", "requested"):
             raise ValueError("workflow status unavailable")
         if run["status"] != "completed":
+            # The cadence gate runs inside the shared, non-cancelling
+            # ``securus-public-runtime`` concurrency group.  Once this run is
+            # executing, a queued sibling cannot own collection; it is waiting
+            # for this run to finish.  Treating that follower as active made a
+            # delayed scheduled run and its watchdog recovery suppress each
+            # other: the scheduled run skipped for PENDING, then the recovery
+            # saw the scheduled run's completed maintenance inside cooldown.
+            #
+            # The external watchdog has no ``exclude_run_id`` and therefore
+            # still blocks on every queued or active runtime before dispatch.
+            # An in-progress sibling remains impossible under shared
+            # concurrency and stays fail-closed if GitHub ever reports one.
+            if (exclude_run_id is not None and
+                    run["status"] in ("queued", "pending", "requested")):
+                continue
             raise CollectionPending("runtime already queued or in progress")
         jobs = api_get(
             f"/repos/{repository}/actions/runs/{run['id']}/jobs?"

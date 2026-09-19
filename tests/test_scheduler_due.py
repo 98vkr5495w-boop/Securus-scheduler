@@ -105,6 +105,49 @@ class SchedulerDueTests(unittest.TestCase):
             now=now, source_get=lambda: self.sources(now, 60), exclude_run_id=42)
         self.assertTrue(due)
 
+    def test_current_cadence_run_ignores_only_queued_concurrency_followers(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 60)
+
+        def history(status):
+            def load(path):
+                if "/runs?" in path:
+                    return {"workflow_runs": [
+                        {"id": 42, "head_branch": "main", "event": "schedule", "status": "in_progress"},
+                        {"id": 43, "head_branch": "main", "event": "workflow_dispatch", "status": status},
+                    ]}
+                self.fail("queued followers have no job history yet")
+            return load
+
+        for status in ("queued", "pending", "requested"):
+            with self.subTest(status=status):
+                due, reason = scheduler_is_due(
+                    history(status), "owner/repo", "securus-scheduler.yml", "main",
+                    cycle_start(now), now=now, source_get=lambda: state,
+                    exclude_run_id=42,
+                )
+                self.assertTrue(due)
+                self.assertIn("frequent feed", reason)
+
+        for status in ("in_progress", "waiting"):
+            with self.subTest(status=status):
+                due, reason = scheduler_is_due(
+                    history(status), "owner/repo", "securus-scheduler.yml", "main",
+                    cycle_start(now), now=now, source_get=lambda: state,
+                    exclude_run_id=42,
+                )
+                self.assertFalse(due)
+                self.assertIn("queued or in progress", reason)
+
+        # The watchdog has no current run to exclude and must remain blocked by
+        # every queued follower before it dispatches another recovery.
+        due, reason = scheduler_is_due(
+            history("queued"), "owner/repo", "securus-scheduler.yml", "main",
+            cycle_start(now), now=now, source_get=lambda: state,
+        )
+        self.assertFalse(due)
+        self.assertIn("queued or in progress", reason)
+
     def test_warning_storage_gets_maintenance_even_with_fresh_feeds(self):
         now = CYCLE + timedelta(hours=3)
         state = self.sources(now, 5)

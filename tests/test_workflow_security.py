@@ -90,6 +90,13 @@ class WorkflowSecurityTests(unittest.TestCase):
             hosted_block,
         )
 
+    def test_scheduler_serializes_runtime_while_watchdog_stays_non_cancelling(self):
+        watchdog = (WORKFLOW.parent / "securus-watchdog.yml").read_text(encoding="utf-8")
+        self.assertIn("securus-public-runtime", self.workflow)
+        self.assertIn("group: securus-public-watchdog", watchdog)
+        self.assertIn("cancel-in-progress: false", self.workflow)
+        self.assertIn("cancel-in-progress: false", watchdog)
+
     def test_unassessable_nba_does_not_suppress_other_sport_scan(self):
         scan_offset = self.final.index("Run one verified Crypto paper scan")
         surface_offset = self.final.index("Surface an unassessable NBA attestation")
