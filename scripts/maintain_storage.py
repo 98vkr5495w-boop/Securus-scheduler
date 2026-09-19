@@ -7,7 +7,7 @@ import json
 import math
 import os
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 SITE = "https://edgelab-sports.jkv9c8bzjn.chatgpt.site"
@@ -21,17 +21,31 @@ class NoRedirect(HTTPRedirectHandler):
         raise RuntimeError("Authenticated maintenance redirects are forbidden")
 
 
-def read_json(request):
-    with build_opener(NoRedirect).open(request, timeout=20) as response:
-        if "application/json" not in response.headers.get("Content-Type", "").lower():
-            raise RuntimeError("Maintenance returned non-JSON data")
-        raw = response.read(524289)
-    if len(raw) > 524288:
-        raise RuntimeError("Maintenance response exceeded the size budget")
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise RuntimeError("Maintenance response must be an object")
-    return value
+def read_json(request, *, attempts=3, sleep=time.sleep):
+    if not 1 <= attempts <= 3:
+        raise ValueError("Maintenance request attempts must be between one and three")
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with build_opener(NoRedirect).open(request, timeout=20) as response:
+                if "application/json" not in response.headers.get("Content-Type", "").lower():
+                    raise RuntimeError("Maintenance returned non-JSON data")
+                raw = response.read(524289)
+            if len(raw) > 524288:
+                raise RuntimeError("Maintenance response exceeded the size budget")
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise RuntimeError("Maintenance response must be an object")
+            return value
+        except HTTPError as error:
+            last_error = error
+            if error.code != 429 and error.code < 500:
+                raise
+        except (URLError, TimeoutError) as error:
+            last_error = error
+        if attempt + 1 < attempts:
+            sleep(min(4, 2 ** attempt))
+    raise RuntimeError(f"Maintenance request failed after {attempts} attempts: {last_error}")
 
 
 def identity():
@@ -56,7 +70,8 @@ def request(path, payload=None):
     if data is not None:
         headers["Content-Type"] = "application/json"
     return read_json(Request(SITE + path, data=data, headers=headers,
-                             method="GET" if data is None else "POST"))
+                             method="GET" if data is None else "POST"),
+                     attempts=3 if data is None else 1)
 
 
 def capacity(value):

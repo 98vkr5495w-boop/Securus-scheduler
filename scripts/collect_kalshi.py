@@ -149,40 +149,64 @@ def post_json(
     path: str,
     payload: dict[str, Any],
     timeout: int = 45,
+    attempts: int = 3,
 ) -> dict[str, Any]:
-    request = Request(
-        f"{os.environ['SECURUS_URL'].rstrip('/')}{path}",
-        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {securus_oidc_token()}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Securus returned HTTP {error.code}: {detail[:500]}") from error
+    if not 1 <= attempts <= 3:
+        raise ValueError("Securus POST attempts must be between one and three")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    token = securus_oidc_token()
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        request = Request(
+            f"{os.environ['SECURUS_URL'].rstrip('/')}{path}",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            last_error = error
+            if error.code != 429 and error.code < 500:
+                detail = error.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Securus returned HTTP {error.code}: {detail[:500]}") from error
+        except (URLError, TimeoutError) as error:
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(min(4.0, 2.0 ** attempt))
+    raise RuntimeError(f"Securus request failed after {attempts} attempts: {last_error}")
 
 
 def securus_json(path: str) -> dict[str, Any]:
-    request = Request(
-        f"{os.environ['SECURUS_URL'].rstrip('/')}{path}",
-        headers={
-            "Authorization": f"Bearer {securus_oidc_token()}",
-            "Accept": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    try:
-        with urlopen(request, timeout=45) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Securus returned HTTP {error.code}: {detail[:500]}") from error
+    token = securus_oidc_token()
+    last_error: Exception | None = None
+    for attempt in range(3):
+        request = Request(
+            f"{os.environ['SECURUS_URL'].rstrip('/')}{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            last_error = error
+            if error.code != 429 and error.code < 500:
+                detail = error.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Securus returned HTTP {error.code}: {detail[:500]}") from error
+        except (URLError, TimeoutError) as error:
+            last_error = error
+        if attempt < 2:
+            time.sleep(min(4.0, 2.0 ** attempt))
+    raise RuntimeError(f"Securus request failed after 3 attempts: {last_error}")
 
 
 def post_batches(kind: str, records: list[dict[str, Any]]) -> None:
@@ -212,6 +236,7 @@ def sync_run(
                 }
             ],
         },
+        attempts=1,
     )
 
 
@@ -808,6 +833,7 @@ def collect_climate_catalog() -> dict[str, Any]:
             "series": relayed_series,
         },
         timeout=300,
+        attempts=1,
     )
     results = response.get("results") if isinstance(response.get("results"), list) else []
     result = results[0] if results and isinstance(results[0], dict) else {}
