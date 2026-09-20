@@ -9,7 +9,7 @@ const NOW = Date.parse('2026-09-10T04:22:00Z');
 const SECRET = 'test-only-never-a-real-credential';
 const iso = age => new Date(NOW - age * 60000).toISOString();
 function sources(age = 0) {
-  return { sources: ['mlb-stats-api', 'action-network', 'sleeper-nfl', 'kalshi', 'open-meteo', 'climate', 'nflverse', 'baseball-savant']
+  return { sources: ['mlb-stats-api', 'action-network', 'sleeper-nfl', 'kalshi', 'open-meteo', 'nflverse', 'baseball-savant']
     .map(id => ({ id, lastRun: { status: 'SUCCEEDED', completedAt: iso(age) } })),
   storage: { capacity: { capacityState: 'NORMAL', utilizationPercent: 60 } } };
 }

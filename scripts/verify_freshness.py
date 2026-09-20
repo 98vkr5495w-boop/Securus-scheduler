@@ -17,7 +17,6 @@ MAX_AGE_MINUTES = {
     "mlb-stats-api": 45,
     "action-network": 45,
     "kalshi": 45,
-    "climate": 60,
     "open-meteo": 90,
     "sleeper-nfl": 150,
     "nba-stats": 180,

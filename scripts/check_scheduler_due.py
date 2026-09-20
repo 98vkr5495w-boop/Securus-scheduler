@@ -25,7 +25,7 @@ RETRY_COOLDOWN_MINUTES = 10
 # progress" would defer recovery forever (observed 2026-09-13, ~15 hours).
 ABANDONED_COLLECTION_MINUTES = 20
 PUBLIC_SOURCE_URL = "https://edgelab-sports.jkv9c8bzjn.chatgpt.site/api/data-sources"
-FREQUENT_SOURCES = frozenset({"mlb-stats-api", "action-network", "sleeper-nfl", "kalshi", "open-meteo", "climate"})
+FREQUENT_SOURCES = frozenset({"mlb-stats-api", "action-network", "sleeper-nfl", "kalshi", "open-meteo"})
 DEEP_SOURCES = frozenset({"nflverse", "baseball-savant"})
 GATED_SOURCES = FREQUENT_SOURCES | DEEP_SOURCES
 

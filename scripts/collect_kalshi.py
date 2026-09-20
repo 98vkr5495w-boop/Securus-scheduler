@@ -941,21 +941,8 @@ def main() -> int:
     started_at = utc_now()
     requested_sport = os.environ.get("KEYLESS_SPORT", "ALL").upper()
     if requested_sport == "CLIMATE":
-        try:
-            result = collect_climate_catalog()
-            print(json.dumps(result))
-            return 0
-        except Exception as error:
-            message = str(error)[:500]
-            # A relay that times out or is rejected must leave a terminal
-            # receipt; otherwise the Site's own RUNNING journal is the only
-            # evidence and freshness stays unverifiable until it expires.
-            try:
-                sync_run("FAILED", 0, started_at, message, source_id="climate")
-            except Exception as sync_error:
-                message = f"{message}; sync reporting failed: {sync_error}"
-            print(message, file=sys.stderr)
-            return 1
+        print("Climate is retired; collection and ingestion are disabled.", file=sys.stderr)
+        return 2
     if requested_sport in ("", "ALL"):
         sports = list(SERIES)
     elif requested_sport in SERIES:

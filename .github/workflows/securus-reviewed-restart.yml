@@ -79,7 +79,9 @@ jobs:
             .agents[0].openBets == 0 and
             .agents[0].sleeves.sports.mode == "NORMAL" and
             .agents[0].sleeves.climate.status == "NO_BET" and
-            any(.agents[0].sleeves.climate.blockers[]; contains("shadow-only")) and
+            .agents[0].sleeves.climate.retired == true and
+            .climate.enabled == false and
+            .climate.shadowOnly == false and
             .strategy.riskControls.reviewedRestartActive == true and
             .strategy.riskControls.riskBaselineBankroll == 191.71 and
             .strategy.riskControls.currentDrawdownFraction == 0 and

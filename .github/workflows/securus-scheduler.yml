@@ -292,13 +292,6 @@ jobs:
           KEYLESS_SPORT: ALL
         run: python scripts/collect_kalshi.py
 
-      - name: Refresh nationwide Kalshi climate markets
-        id: climate
-        continue-on-error: true
-        env:
-          KEYLESS_SPORT: CLIMATE
-        run: python scripts/collect_kalshi.py
-
       - name: Refresh identity for deep sources
         if: steps.cadence.outputs.run_deep == 'true'
         id: oidc_deep
@@ -424,7 +417,6 @@ jobs:
           --source mlb-stats-api
           --source action-network
           --source kalshi
-          --source climate
           --source open-meteo
           --source sleeper-nfl
           --source nba-stats
