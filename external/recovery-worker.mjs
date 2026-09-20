@@ -1,9 +1,9 @@
 // Independent timer transport only. It cannot directly collect or place bets.
-export const SITE = 'https://edgelab-sports.jkv9c8bzjn.chatgpt.site';
-export const REPOSITORY = '98vkr5495w-boop/Securus-scheduler';
+const SITE = 'https://edgelab-sports.jkv9c8bzjn.chatgpt.site';
+const REPOSITORY = '98vkr5495w-boop/Securus-scheduler';
 const WORKFLOW = 'securus-scheduler.yml';
 const API = 'https://api.github.com';
-const VERSION = 'securus-external-recovery-20260910.1';
+const VERSION = 'securus-external-recovery-20260920.1';
 const FREQUENT = ['mlb-stats-api', 'action-network', 'sleeper-nfl', 'kalshi', 'open-meteo', 'climate'];
 const DEEP = ['nflverse', 'baseball-savant'];
 const MINUTE = 60000;
@@ -70,7 +70,9 @@ export async function checkAndRecover(env, io = {}) {
     if (!github && url !== `${SITE}/api/data-sources`) throw new Error('UNEXPECTED_DESTINATION');
     try {
       const response = await fetcher(url, {
-        method, redirect: 'error', signal: controller.signal,
+        // Older Workers runtimes reject redirect: 'error' before making a
+        // request. Manual mode is supported and 3xx responses fail below.
+        method, redirect: 'manual', signal: controller.signal,
         headers: {
           Accept: 'application/json', 'User-Agent': VERSION,
           ...(github ? { Authorization: `Bearer ${env.GITHUB_RECOVERY_TOKEN}`,

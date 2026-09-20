@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { checkAndRecover, feedsDue, cycleKey, SITE, REPOSITORY } from '../external/recovery-worker.mjs';
+import worker, { checkAndRecover, feedsDue, cycleKey } from '../external/recovery-worker.mjs';
+
+const SITE = 'https://edgelab-sports.jkv9c8bzjn.chatgpt.site';
+const REPOSITORY = '98vkr5495w-boop/Securus-scheduler';
 
 const NOW = Date.parse('2026-09-10T04:22:00Z');
 const SECRET = 'test-only-never-a-real-credential';
@@ -65,8 +68,21 @@ test('GitHub credentials never reach Site and redirects are disabled', async () 
   const f = fixture(); await f.execute();
   assert.equal(f.calls[0].headers.Authorization, undefined);
   for (const call of f.calls) {
-    assert.equal(call.redirect, 'error');
+    assert.equal(call.redirect, 'manual');
     if (call.headers.Authorization) assert.ok(call.url.startsWith(`https://api.github.com/repos/${REPOSITORY}/`));
+  }
+});
+
+test('Site and GitHub redirects fail without following Location or dispatching', async () => {
+  for (const origin of [SITE, 'https://api.github.com']) {
+    for (const status of [301, 302, 303, 307, 308]) {
+      const f = fixture({ respond: (url) => url.startsWith(origin)
+        ? new Response(null, { status, headers: { Location: 'https://untrusted.example/' } }) : null });
+      await assert.rejects(f.execute(), new RegExp(`HTTP_${status}`));
+      assert.equal(f.calls.length, origin === SITE ? 1 : 2);
+      assert.equal(f.calls.filter(x => x.method === 'POST').length, 0);
+      assert.ok(f.calls.every(x => !x.url.includes('untrusted.example')));
+    }
   }
 });
 
