@@ -1,9 +1,12 @@
 import unittest
 
-from scripts.collect_kalshi import market_metadata
+from scripts.collect_kalshi import SERIES, market_metadata
 
 
 class NflContractMetadataTests(unittest.TestCase):
+    def test_nfl_readiness_requires_core_moneyline_not_optional_spreads(self):
+        self.assertEqual([s["ticker"] for s in SERIES["NFL"] if s.get("required")], ["KXNFLGAME"])
+
     def test_public_rules_and_scalar_settlement_survive_transport(self):
         primary = "If Philadelphia wins, then the market resolves to Yes."
         secondary = "If the game ends in a tie, the market will resolve to $0.50 for each team."
