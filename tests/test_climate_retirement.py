@@ -9,6 +9,13 @@ from scripts.verify_freshness import MAX_AGE_MINUTES
 
 
 class ClimateRetirementTests(unittest.TestCase):
+    def test_reviewed_restart_is_manual_only(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/securus-reviewed-restart.yml").read_text()
+        self.assertIn("  workflow_dispatch:", workflow)
+        self.assertNotIn("  push:", workflow)
+        self.assertNotIn("  schedule:", workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
+
     def test_climate_is_not_a_scheduler_or_freshness_dependency(self):
         self.assertNotIn("climate", GATED_SOURCES)
         self.assertNotIn("climate", MAX_AGE_MINUTES)

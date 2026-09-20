@@ -2,10 +2,6 @@ name: Securus reviewed Crypto restart
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/securus-reviewed-restart.yml
 
 permissions:
   contents: read
@@ -17,6 +13,7 @@ concurrency:
 
 jobs:
   restart:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
