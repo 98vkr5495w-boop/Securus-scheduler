@@ -244,6 +244,26 @@ jobs:
             exit 1
           fi
 
+      - name: Refresh free NFL and MLB research feeds
+        id: research
+        continue-on-error: true
+        timeout-minutes: 4
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_collect.outputs.token }}
+        shell: bash
+        run: |
+          set -u
+          failures=()
+          for source in espn-nfl nfl-official-injuries rotoworld-nfl fangraphs-mlb cbs-mlb-injuries rotoballer-mlb; do
+            if ! bash scripts/collect_source.sh "mode=fast&source=$source"; then
+              failures+=("$source")
+            fi
+          done
+          if ((${#failures[@]})); then
+            echo "::warning::Optional research feeds were not refreshed: ${failures[*]}"
+            exit 1
+          fi
+
       - name: Refresh official NBA injury availability
         id: nba_collect
         continue-on-error: true
