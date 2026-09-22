@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Transport raw public Kalshi prop documents to the private Securus parser.
+
+No models, matching rules, betting decisions, or credentials are stored here.
+One fixed API host, bounded responses, sequential requests, and no retries.
+"""
+from datetime import datetime, timezone
+import json
+import sys
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+if __package__:
+    from .collect_kalshi import API_BASE, USER_AGENT, post_json as securus_post
+else:
+    from collect_kalshi import API_BASE, USER_AGENT, post_json as securus_post
+
+SERIES = {
+    "MLB": ("KXMLBKS", "KXMLBHR"),
+    "NFL": ("KXNFLPASSYDS", "KXNFLRSHYDS", "KXNFLRECYDS", "KXNFLREC", "KXNFLPASSTDS"),
+}
+MAX_BYTES = 8_000_000
+
+
+class OfficialTransport:
+    def __init__(self):
+        self.blocked = False
+        self.last_request = 0.0
+
+    def get(self, path):
+        if self.blocked:
+            raise RuntimeError("upstream unavailable in this cycle")
+        time.sleep(max(0.0, 1.0 - (time.monotonic() - self.last_request)))
+        self.last_request = time.monotonic()
+        try:
+            request = Request(API_BASE + path, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+            with urlopen(request, timeout=20) as response:
+                body = response.read(MAX_BYTES + 1)
+                if len(body) > MAX_BYTES:
+                    raise ValueError("oversized upstream document")
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    raise ValueError("invalid upstream document")
+                return data
+        except Exception:
+            # A rate limit or other failure stops provider requests for the rest
+            # of this cycle, across both sports. Never switch hosts or identities.
+            self.blocked = True
+            raise
+
+
+def capture(sport, transport):
+    captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    entries = []
+    targets = set()
+    for ticker in SERIES[sport]:
+        try:
+            series = transport.get("/series/" + ticker)
+            events = transport.get("/events?" + urlencode({
+                "series_ticker": ticker, "status": "open", "limit": "200",
+                "with_nested_markets": "true", "with_milestones": "true",
+            }))
+            if not isinstance(events.get("events"), list) or not isinstance(events.get("milestones"), list):
+                raise ValueError("missing official event envelope")
+            for milestone in events["milestones"]:
+                details = milestone.get("details") or {}
+                targets.update(str(details[key]) for key in ("away_team_id", "home_team_id") if details.get(key))
+            for event in events["events"]:
+                for market in event.get("markets", []):
+                    strike = market.get("custom_strike") or {}
+                    prefix = "baseball" if sport == "MLB" else "football"
+                    targets.update(str(strike[key]) for key in (prefix + "_player", prefix + "_team") if strike.get(key))
+            entries.append({"ticker": ticker, "series": series, "events": events})
+        except Exception:
+            entries.append({"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"})
+    documents = []
+    try:
+        ids = sorted(targets)
+        for offset in range(0, len(ids), 150):
+            query = urlencode([("ids", target) for target in ids[offset:offset + 150]] + [("page_size", "200")])
+            data = transport.get("/structured_targets?" + query)
+            if not isinstance(data.get("structured_targets"), list):
+                raise ValueError("missing official target envelope")
+            documents.extend(data["structured_targets"])
+        for entry in entries:
+            if "error" not in entry:
+                entry["targets"] = {"structured_targets": documents}
+    except Exception:
+        entries = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
+    payload = {"sport": sport, "capturedAt": captured_at, "series": entries}
+    if len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_BYTES:
+        payload["series"] = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
+    return payload
+
+
+def main():
+    transport = OfficialTransport()
+    failed = False
+    for sport in SERIES:
+        try:
+            payload = capture(sport, transport)
+            result = securus_post("/api/kalshi-props-ingest", payload, timeout=90, attempts=1)
+            ok = result.get("accepted") is True and len(result.get("results", [])) == 1 and result["results"][0].get("status") == "SUCCEEDED"
+            failed |= not ok
+            print(json.dumps({"source": "kalshi-props", "sport": sport, "status": "SUCCEEDED" if ok else "FAILED"}))
+        except Exception:
+            failed = True
+            print(json.dumps({"source": "kalshi-props", "sport": sport, "status": "FAILED"}))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

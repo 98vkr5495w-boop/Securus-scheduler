@@ -520,6 +520,8 @@ def collect_sport(
     successful_series = 0
 
     for series_config in SERIES[sport]:
+        if os.environ.get("KALSHI_PROPS_TRANSPORT") == "separate" and sport in {"MLB", "NFL"} and series_config.get("market_family") == "player_prop":
+            continue
         ticker = str(series_config["ticker"])
         try:
             series_odds, series_stats, series_warnings = collect_series(sport, series_config)

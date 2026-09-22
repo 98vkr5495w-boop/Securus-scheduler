@@ -30,6 +30,7 @@ on:
       - scripts/collect_source.sh
       - scripts/collect_weather.py
       - scripts/collect_kalshi.py
+      - scripts/collect_kalshi_props.py
       - scripts/run_crypto_paper.py
       - scripts/verify_freshness.py
       - scripts/check_scheduler_due.py
@@ -66,6 +67,7 @@ jobs:
           python -m py_compile \
             scripts/collect_weather.py \
             scripts/collect_kalshi.py \
+            scripts/collect_kalshi_props.py \
             scripts/run_crypto_paper.py \
             scripts/verify_freshness.py \
             scripts/check_scheduler_due.py \
@@ -310,6 +312,7 @@ jobs:
         continue-on-error: true
         env:
           KEYLESS_SPORT: ALL
+          KALSHI_PROPS_TRANSPORT: separate
         run: python scripts/collect_kalshi.py
 
       - name: Refresh identity for player prop feeds
@@ -325,19 +328,12 @@ jobs:
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
 
-      - name: Refresh official MLB player prop identities and prices
+      - name: Transport official player prop identities and prices
         if: steps.oidc_props.outcome == 'success'
         continue-on-error: true
         env:
           SECURUS_OIDC_TOKEN: ${{ steps.oidc_props.outputs.token }}
-        run: bash scripts/collect_source.sh "mode=fast&source=kalshi-props&sport=MLB"
-
-      - name: Refresh official NFL player prop identities and prices
-        if: steps.oidc_props.outcome == 'success'
-        continue-on-error: true
-        env:
-          SECURUS_OIDC_TOKEN: ${{ steps.oidc_props.outputs.token }}
-        run: bash scripts/collect_source.sh "mode=fast&source=kalshi-props&sport=NFL"
+        run: python scripts/collect_kalshi_props.py
 
       - name: Refresh independent player prop sportsbook prices
         if: steps.oidc_props.outcome == 'success'
