@@ -90,6 +90,22 @@ class WorkflowSecurityTests(unittest.TestCase):
             hosted_block,
         )
 
+    def test_deep_only_cycle_does_not_duplicate_fresh_high_volume_feeds(self):
+        gate = job_block(self.workflow, "cadence-gate", "keepalive")
+        self.assertIn("frequent_sources_due: ${{ steps.due.outputs.frequent_sources_due }}", gate)
+        cadence = self.collect.split("Choose bounded cadence", 1)[1].split(
+            "Refresh identity after storage maintenance", 1
+        )[0]
+        self.assertIn("run_frequent=false", cadence)
+        self.assertIn('"${{ needs.cadence-gate.outputs.deep_sources_due }}" == "true"', cadence)
+        self.assertIn('"${{ needs.cadence-gate.outputs.frequent_sources_due }}" != "true"', cadence)
+        self.assertIn('"${{ inputs.recovery }}" != "true"', cadence)
+        self.assertGreaterEqual(
+            self.collect.count("if: steps.cadence.outputs.run_frequent == 'true'"),
+            6,
+        )
+        self.assertIn("if: steps.cadence.outputs.run_deep == 'true'", self.collect)
+
     def test_scheduler_serializes_runtime_while_watchdog_stays_non_cancelling(self):
         watchdog = (WORKFLOW.parent / "securus-watchdog.yml").read_text(encoding="utf-8")
         self.assertIn("securus-public-runtime", self.workflow)

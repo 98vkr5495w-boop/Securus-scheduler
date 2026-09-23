@@ -11,6 +11,7 @@ from scripts.check_scheduler_due import (
     scheduler_is_due,
     effective_cycle,
     source_refresh_due,
+    frequent_refresh_due,
     read_public_source_status,
     FREQUENT_SOURCES,
     DEEP_SOURCES,
@@ -445,11 +446,23 @@ class SchedulerDueTests(unittest.TestCase):
         now = CYCLE + timedelta(hours=8)
         payload = self.sources(now)
         self.assertFalse(deep_refresh_due(payload, now))
+        self.assertFalse(frequent_refresh_due(payload, now))
         for row in payload["sources"]:
             if row["id"] in DEEP_SOURCES:
                 row["lastRun"]["completedAt"] = format_cycle_key(now - timedelta(hours=6))
         self.assertTrue(deep_refresh_due(payload, now))
+        self.assertFalse(frequent_refresh_due(payload, now),
+            "a deep-only cycle must not duplicate fresh high-volume feeds")
         self.assertTrue(source_refresh_due(payload, now))
+
+    def test_frequent_due_is_reported_independently_from_deep_cadence(self):
+        now = CYCLE + timedelta(hours=8)
+        payload = self.sources(now)
+        for row in payload["sources"]:
+            if row["id"] in FREQUENT_SOURCES:
+                row["lastRun"]["completedAt"] = format_cycle_key(now - timedelta(minutes=30))
+        self.assertTrue(frequent_refresh_due(payload, now))
+        self.assertFalse(deep_refresh_due(payload, now))
 
     def test_failed_source_completion_never_counts_as_fresh(self):
         now = CYCLE + timedelta(minutes=70)

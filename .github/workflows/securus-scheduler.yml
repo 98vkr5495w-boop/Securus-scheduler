@@ -111,6 +111,7 @@ jobs:
       should_run: ${{ steps.due.outputs.should_run }}
       cycle_key: ${{ steps.due.outputs.cycle_key }}
       gate_state: ${{ steps.due.outputs.gate_state }}
+      frequent_sources_due: ${{ steps.due.outputs.frequent_sources_due }}
       deep_sources_due: ${{ steps.due.outputs.deep_sources_due }}
     steps:
       - name: Check out scheduler
@@ -199,8 +200,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          run_frequent=true
           run_deep=false
           cycle_key="${{ needs.cadence-gate.outputs.cycle_key }}"
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "${{ inputs.recovery }}" != "true" && \
+                "${{ needs.cadence-gate.outputs.deep_sources_due }}" == "true" && \
+                "${{ needs.cadence-gate.outputs.frequent_sources_due }}" != "true" ]]; then
+            run_frequent=false
+          fi
           if [[ "${{ needs.cadence-gate.outputs.deep_sources_due }}" == "true" ]]; then
             run_deep=true
           elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "${{ inputs.recovery }}" != "true" ]]; then
@@ -212,7 +219,9 @@ jobs:
               run_deep=true
             fi
           fi
+          echo "run_frequent=$run_frequent" >> "$GITHUB_OUTPUT"
           echo "run_deep=$run_deep" >> "$GITHUB_OUTPUT"
+          echo "Frequent-source refresh: $run_frequent"
           echo "Deep-source refresh: $run_deep"
 
       - name: Refresh identity after storage maintenance
@@ -228,6 +237,7 @@ jobs:
           echo "token=$token" >> "$GITHUB_OUTPUT"
 
       - name: Refresh hosted decision feeds
+        if: steps.cadence.outputs.run_frequent == 'true'
         id: hosted
         continue-on-error: true
         env:
@@ -247,6 +257,7 @@ jobs:
           fi
 
       - name: Refresh free NFL and MLB research feeds
+        if: steps.cadence.outputs.run_frequent == 'true'
         id: research
         continue-on-error: true
         timeout-minutes: 4
@@ -267,6 +278,7 @@ jobs:
           fi
 
       - name: Refresh official NBA injury availability
+        if: steps.cadence.outputs.run_frequent == 'true'
         id: nba_collect
         continue-on-error: true
         env:
@@ -301,6 +313,7 @@ jobs:
           --github-output "$GITHUB_OUTPUT"
 
       - name: Refresh event weather
+        if: steps.cadence.outputs.run_frequent == 'true'
         id: weather
         continue-on-error: true
         env:
@@ -308,6 +321,7 @@ jobs:
         run: python scripts/collect_weather.py
 
       - name: Refresh official Kalshi sports prices
+        if: steps.cadence.outputs.run_frequent == 'true'
         id: kalshi
         continue-on-error: true
         env:
@@ -316,6 +330,7 @@ jobs:
         run: python scripts/collect_kalshi.py
 
       - name: Refresh identity for player prop feeds
+        if: steps.cadence.outputs.run_frequent == 'true'
         id: oidc_props
         continue-on-error: true
         shell: bash

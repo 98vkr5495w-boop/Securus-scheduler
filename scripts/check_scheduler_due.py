@@ -235,8 +235,13 @@ def deep_refresh_due(payload: dict[str, Any], now: datetime) -> bool:
 
 def source_refresh_due(payload: dict[str, Any], now: datetime) -> bool:
     """Use completed feed timestamps, never a workflow or paper-scan receipt."""
-    return (sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES)
+    return (frequent_refresh_due(payload, now)
             or deep_refresh_due(payload, now) or paper_scan_due(payload, now))
+
+
+def frequent_refresh_due(payload: dict[str, Any], now: datetime) -> bool:
+    """True when a decision-critical frequent feed needs a real refresh."""
+    return sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES)
 
 
 def paper_scan_due(payload: dict[str, Any], now: datetime) -> bool:
@@ -499,7 +504,9 @@ def main() -> int:
             output.write(f"should_run={str(due).lower()}\n")
             output.write(f"cycle_key={cycle_key}\n")
             output.write(f"gate_state={state}\n")
+            frequent_due = source_payload is not None and frequent_refresh_due(source_payload, now)
             deep_due = source_payload is not None and deep_refresh_due(source_payload, now)
+            output.write(f"frequent_sources_due={str(frequent_due).lower()}\n")
             output.write(f"deep_sources_due={str(deep_due).lower()}\n")
     if due and args.dispatch_if_due:
         print("Dispatched the existing trusted scheduler workflow.")
