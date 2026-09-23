@@ -154,17 +154,26 @@ def storage_blocker(payload: dict[str, Any]) -> str | None:
 
 
 def latest_storage_maintenance_at(payload: dict[str, Any]) -> datetime | None:
-    """Return the newest durable maintenance timestamp exposed by the Site."""
+    """Return the newest independent maintenance timestamp exposed by the Site.
+
+    GitHub job history already covers scheduler-owned maintenance. Counting the
+    current scheduler run's intentional maintenance-before-collection step here
+    would make every guarded recovery defer itself. The Site's independent
+    receipt closes only the external Cloudflare visibility gap.
+    """
     storage = payload.get("storage") or {}
+    assurance = storage.get("assurance") or {}
+    independent = parse_timestamp(assurance.get("lastIndependentMaintenanceAt"))
+    if independent is not None:
+        return independent
     capacity = storage.get("capacity") or {}
     archives = capacity.get("archives") or {}
     last_maintenance = archives.get("lastMaintenance") or {}
-    assurance = storage.get("assurance") or {}
+    if last_maintenance.get("triggerName") != "cloudflare-cron-10m":
+        return None
     candidates = [
         parse_timestamp(last_maintenance.get("startedAt")),
         parse_timestamp(last_maintenance.get("completedAt")),
-        parse_timestamp(assurance.get("lastMaintenanceSuccessAt")),
-        parse_timestamp(assurance.get("lastIndependentMaintenanceAt")),
     ]
     return max((value for value in candidates if value is not None), default=None)
 

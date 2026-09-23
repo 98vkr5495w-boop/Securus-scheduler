@@ -114,6 +114,23 @@ class SchedulerDueTests(unittest.TestCase):
         self.assertIn("cooldown", reason)
         self.assertEqual(calls, [])
 
+        state["storage"]["assurance"]["lastIndependentMaintenanceAt"] = format_cycle_key(
+            now - timedelta(minutes=12)
+        )
+        state["storage"]["capacity"]["archives"] = {"lastMaintenance": {
+            "triggerName": "public-github-actions-verified",
+            "completedAt": format_cycle_key(now),
+        }}
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertTrue(due, "the current run's own maintenance must not defer collection")
+        self.assertEqual(len(calls), 1)
+        calls.clear()
+
+        state["storage"]["assurance"]["lastIndependentMaintenanceAt"] = format_cycle_key(
+            now - timedelta(minutes=8)
+        )
         state["storage"]["capacity"] = {
             "capacityState": "CRITICAL", "utilizationPercent": 85.2,
             "archives": {"lastMaintenance": {
