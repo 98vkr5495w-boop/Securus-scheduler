@@ -99,6 +99,43 @@ class SchedulerDueTests(unittest.TestCase):
         self.assertFalse(due)
         self.assertEqual(calls, [])
 
+    def test_recent_independent_maintenance_blocks_all_recovery_modes(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 60)
+        state["storage"]["assurance"] = {
+            "lastIndependentMaintenanceAt": format_cycle_key(now - timedelta(minutes=8)),
+        }
+        calls = []
+        due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertFalse(due)
+        self.assertIn("storage maintenance", reason)
+        self.assertIn("cooldown", reason)
+        self.assertEqual(calls, [])
+
+        state["storage"]["capacity"] = {
+            "capacityState": "CRITICAL", "utilizationPercent": 85.2,
+            "archives": {"lastMaintenance": {
+                "startedAt": format_cycle_key(now - timedelta(minutes=9)),
+            }},
+        }
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertFalse(due, "recent external maintenance must also block maintenance-only dispatch")
+        self.assertEqual(calls, [])
+
+        state["storage"]["assurance"]["lastIndependentMaintenanceAt"] = format_cycle_key(
+            now - timedelta(minutes=10)
+        )
+        state["storage"]["capacity"] = {"capacityState": "NORMAL", "utilizationPercent": 50}
+        due, _ = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+            source_get=lambda: state)
+        self.assertTrue(due, "the bounded maintenance cooldown expires at ten minutes")
+        self.assertEqual(len(calls), 1)
+
     def test_current_cadence_run_does_not_block_itself(self):
         now = CYCLE + timedelta(hours=3)
         api = lambda path: {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "schedule", "status": "in_progress"}]}

@@ -153,6 +153,27 @@ def storage_blocker(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def latest_storage_maintenance_at(payload: dict[str, Any]) -> datetime | None:
+    """Return the newest durable maintenance timestamp exposed by the Site."""
+    storage = payload.get("storage") or {}
+    capacity = storage.get("capacity") or {}
+    archives = capacity.get("archives") or {}
+    last_maintenance = archives.get("lastMaintenance") or {}
+    assurance = storage.get("assurance") or {}
+    candidates = [
+        parse_timestamp(last_maintenance.get("startedAt")),
+        parse_timestamp(last_maintenance.get("completedAt")),
+        parse_timestamp(assurance.get("lastMaintenanceSuccessAt")),
+        parse_timestamp(assurance.get("lastIndependentMaintenanceAt")),
+    ]
+    return max((value for value in candidates if value is not None), default=None)
+
+
+def storage_maintenance_in_cooldown(payload: dict[str, Any], now: datetime) -> bool:
+    latest = latest_storage_maintenance_at(payload)
+    return latest is not None and now - latest < timedelta(minutes=RETRY_COOLDOWN_MINUTES)
+
+
 def collection_in_progress(payload: dict[str, Any], now: datetime | None = None) -> bool:
     """True only for a RUNNING receipt young enough to still be a live worker.
 
@@ -322,6 +343,8 @@ def scheduler_is_due(
                 return False, "frequent feeds are under 30 minutes old and deep feeds are within their six-hour cadence"
         except Exception:
             return False, "live source timestamps and storage could not be verified; recovery deferred, not confirmed healthy"
+        if storage_maintenance_in_cooldown(payload, now):
+            return False, f"{reason}; storage maintenance is within the bounded 10-minute retry cooldown; readiness remains fail-closed"
         if github_error:
             # In particular, do not recursively dispatch on every completion
             # when both status services are unavailable and cooldown is unknown.
@@ -378,6 +401,7 @@ def recover_cycle(
                 # early for fresh feeds, unknown history or a pending runtime.
                 attempted, _ = collection_timestamps(api_get, repository, workflow, branch)
                 if (not collection_in_progress(payload, now or boundary) and
+                    not storage_maintenance_in_cooldown(payload, now or boundary) and
                     (attempted is None or (now or boundary) - attempted >= timedelta(minutes=RETRY_COOLDOWN_MINUTES))):
                     due = maintenance_only = True
                     level = "critical" if critical else "warning"
