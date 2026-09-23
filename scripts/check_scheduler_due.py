@@ -164,18 +164,30 @@ def latest_storage_maintenance_at(payload: dict[str, Any]) -> datetime | None:
     storage = payload.get("storage") or {}
     assurance = storage.get("assurance") or {}
     independent = parse_timestamp(assurance.get("lastIndependentMaintenanceAt"))
-    if independent is not None:
-        return independent
     capacity = storage.get("capacity") or {}
     archives = capacity.get("archives") or {}
     last_maintenance = archives.get("lastMaintenance") or {}
-    if last_maintenance.get("triggerName") != "cloudflare-cron-10m":
-        return None
-    candidates = [
-        parse_timestamp(last_maintenance.get("startedAt")),
-        parse_timestamp(last_maintenance.get("completedAt")),
-    ]
-    return max((value for value in candidates if value is not None), default=None)
+    trigger_name = last_maintenance.get("triggerName")
+
+    # The Site can project lastIndependentMaintenanceAt from its newest
+    # maintenance receipt even when that receipt belongs to this scheduler.
+    # Prefer the explicit receipt identity whenever it is available. GitHub
+    # job history separately cools down scheduler-owned maintenance, while a
+    # cadence gate excludes only its own current run so maintenance followed
+    # intentionally by collection cannot defer itself.
+    if isinstance(trigger_name, str) and trigger_name:
+        if trigger_name != "cloudflare-cron-10m":
+            return None
+        candidates = [
+            independent,
+            parse_timestamp(last_maintenance.get("startedAt")),
+            parse_timestamp(last_maintenance.get("completedAt")),
+        ]
+        return max((value for value in candidates if value is not None), default=None)
+
+    # Older Site projections may omit receipt identity. In that case the
+    # dedicated independent timestamp remains the only bounded evidence.
+    return independent
 
 
 def storage_maintenance_in_cooldown(payload: dict[str, Any], now: datetime) -> bool:

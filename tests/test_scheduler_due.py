@@ -155,10 +155,34 @@ class SchedulerDueTests(unittest.TestCase):
 
     def test_current_cadence_run_does_not_block_itself(self):
         now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 60)
+        state["storage"]["assurance"] = {
+            "lastIndependentMaintenanceAt": format_cycle_key(now),
+        }
+        state["storage"]["capacity"]["archives"] = {"lastMaintenance": {
+            "triggerName": "public-github-actions-verified",
+            "completedAt": format_cycle_key(now),
+        }}
         api = lambda path: {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "schedule", "status": "in_progress"}]}
         due, _ = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main", cycle_start(now),
-            now=now, source_get=lambda: self.sources(now, 60), exclude_run_id=42)
+            now=now, source_get=lambda: state, exclude_run_id=42)
         self.assertTrue(due)
+
+    def test_external_maintenance_receipt_still_blocks_current_cadence_run(self):
+        now = CYCLE + timedelta(hours=3)
+        state = self.sources(now, 60)
+        state["storage"]["assurance"] = {
+            "lastIndependentMaintenanceAt": format_cycle_key(now - timedelta(minutes=2)),
+        }
+        state["storage"]["capacity"]["archives"] = {"lastMaintenance": {
+            "triggerName": "cloudflare-cron-10m",
+            "completedAt": format_cycle_key(now - timedelta(minutes=2)),
+        }}
+        api = lambda path: {"workflow_runs": [{"id": 42, "head_branch": "main", "event": "schedule", "status": "in_progress"}]}
+        due, reason = scheduler_is_due(api, "owner/repo", "securus-scheduler.yml", "main", cycle_start(now),
+            now=now, source_get=lambda: state, exclude_run_id=42)
+        self.assertFalse(due)
+        self.assertIn("storage maintenance", reason)
 
     def test_current_cadence_run_ignores_only_queued_concurrency_followers(self):
         now = CYCLE + timedelta(hours=3)
