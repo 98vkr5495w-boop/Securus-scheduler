@@ -541,9 +541,11 @@ def main() -> int:
     state = gate_state(due, reason)
     print(f"Scheduler cycle {cycle_key} due: {str(due).lower()} ({reason}). Gate state: {state}.")
     if state == "DEFERRED":
-        # A deferred cycle leaves feeds stale. Annotate it so the run cannot be
-        # mistaken for a healthy skip; the caller decides whether to fail.
-        print(f"::warning::Scheduler cycle {cycle_key} was deferred without refreshing feeds: {reason}.")
+        # The cadence workflow consumes gate_state and fails its own explicit
+        # sentinel step. The standalone watchdog has no such caller: its CLI
+        # must fail too, not turn a warned-but-deferred recovery into green CI.
+        severity = "error" if args.dispatch_if_due else "warning"
+        print(f"::{severity}::Scheduler cycle {cycle_key} was deferred without refreshing feeds: {reason}.")
     if args.github_output:
         with Path(args.github_output).open("a", encoding="utf-8") as output:
             output.write(f"should_run={str(due).lower()}\n")
@@ -555,7 +557,7 @@ def main() -> int:
             output.write(f"deep_sources_due={str(deep_due).lower()}\n")
     if due and args.dispatch_if_due:
         print("Dispatched the existing trusted scheduler workflow.")
-    return 0
+    return 1 if args.dispatch_if_due and state == "DEFERRED" else 0
 
 
 if __name__ == "__main__":

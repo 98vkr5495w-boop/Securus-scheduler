@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 import unittest
 
@@ -20,6 +22,7 @@ from scripts.check_scheduler_due import (
     abandoned_collections,
     gate_state,
     ABANDONED_COLLECTION_MINUTES,
+    main,
 )
 
 
@@ -46,6 +49,46 @@ def fake_api(
 
 
 class SchedulerDueTests(unittest.TestCase):
+    def run_cli(self, outcome, *, dispatch=True):
+        argv = ['check_scheduler_due.py', '--repository', 'owner/repo']
+        if dispatch:
+            argv.append('--dispatch-if-due')
+        output = StringIO()
+        with patch('sys.argv', argv), patch('scripts.check_scheduler_due.GitHubApi'), \
+                patch('scripts.check_scheduler_due.recover_cycle', return_value=outcome), \
+                patch('scripts.check_scheduler_due.scheduler_is_due', return_value=outcome), \
+                redirect_stdout(output):
+            return main(), output.getvalue()
+
+    def test_watchdog_cli_cannot_report_deferred_as_success(self):
+        for reason in [
+            'a frequent feed is due; storage maintenance is within the bounded 10-minute retry cooldown',
+            'collection history unavailable; recovery deferred, not confirmed healthy',
+            'live storage health unavailable; collection blocked',
+        ]:
+            code, output = self.run_cli((False, reason))
+            self.assertEqual(code, 1)
+            self.assertIn('Gate state: DEFERRED.', output)
+            self.assertIn('::error::', output)
+            self.assertNotIn('Dispatched the existing', output)
+
+    def test_watchdog_cli_keeps_fresh_pending_and_accepted_dispatch_distinct(self):
+        for outcome, state in [
+            ((False, 'frequent feeds are under 30 minutes old'), 'FRESH'),
+            ((False, 'runtime already queued or in progress'), 'PENDING'),
+            ((True, 'a frequent feed is due for refresh'), 'DUE'),
+        ]:
+            code, output = self.run_cli(outcome)
+            self.assertEqual(code, 0)
+            self.assertIn(f'Gate state: {state}.', output)
+            self.assertNotIn('::error::', output)
+
+    def test_cadence_cli_preserves_its_existing_caller_owned_deferred_failure(self):
+        code, output = self.run_cli((False, 'storage status unavailable'), dispatch=False)
+        self.assertEqual(code, 0)
+        self.assertIn('Gate state: DEFERRED.', output)
+        self.assertIn('::warning::', output)
+
     def test_recovery_blocks_unknown_storage_and_pending_runtime(self):
         now = CYCLE + timedelta(hours=3)
         for capacity in [None, {},
