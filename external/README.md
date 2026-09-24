@@ -4,12 +4,23 @@ Status: prepared source, **not deployed or verified**. The existing hourly ChatG
 health recovery remains a separate fallback. This Worker removes dependence on
 GitHub's cron delivery; it still uses GitHub's API and runners for collection.
 
-The Worker checks public feed timestamps every ten minutes and dispatches only
+The Worker checks public feed timestamps and the completed paper-scan journal
+every ten minutes and dispatches only
 the existing trusted `main` scheduler when a frequent feed reaches 30 minutes or
 a deep-stat feed reaches six hours. The scheduler rechecks freshness, preserves
 shared concurrency, and uses its canonical cycle journal to prevent duplicate
 paper scans. No betting policy, Site source, database, or private telemetry lives
 in this transport repository.
+
+The prepared recovery transport fails closed on stale/unknown D1 capacity,
+unfinished source receipts, unfinished maintenance, incomplete job pages, or
+unknown runtime history. It honors the ten-minute cooldown for both collection
+and maintenance, including the separate Cloudflare timer, and rereads Site
+evidence immediately before dispatch. The Site remains the atomic lease owner;
+the public response does not expose raw lease contents. An old RUNNING receipt
+is never manually treated as expired here: the Site must project abandonment
+to FAILED. A missing recovery credential fails visibly even while feeds are
+fresh. A completed paper scan older than 60 minutes cannot report FEEDS_CURRENT.
 
 ## Activation requires the owner's account
 
@@ -36,9 +47,10 @@ in this transport repository.
 
 ## Maintenance and remaining acceptance checks
 
-The existing maintenance Worker source and pairing guide are already served by
-the Site at `/securus-worker-install.html`. Finish its secure pairing and actual
-ten-minute Cron Trigger separately. This recovery Worker refuses dispatch at
+The separate storage-only maintenance Worker is already deployed and has
+produced durable `cloudflare-cron-10m` completion receipts. Preserve its existing
+identity, pairing, and Cron Trigger. Its installer is served by the Site at
+`/securus-worker-install.html`. This recovery Worker refuses dispatch at
 85% storage utilization or when capacity cannot be verified; independent
 maintenance must restore headroom first. Do not raise the storage limit or
 disable freshness checks to obtain a green status.
@@ -47,6 +59,18 @@ Activation is incomplete until real `cloudflare-cron-10m` maintenance completion
 are visible, repeated recovery deliveries have been observed, storage declines
 below its 75% warning boundary, and a 24-hour actual-size trend shows maintenance
 keeping up. Do not claim these acceptance checks from tests or source presence.
+
+Successful checks log redacted result codes; they are not delivered external
+alerts. Configure and verify the owner's chosen alert destination separately.
+The Site's `SECURUS_ALERT_WEBHOOK_URL` and maintenance Worker's
+`ALERT_WEBHOOK_URL` are distinct settings. Do not put either secret in Git or
+assume that configuring one configures the other. Token expiration/rotation and
+an actual delivered test alert are operational acceptance checks.
+
+The mandatory maintenance cooldown can defer recovery while the independent
+maintenance timer is active. Do not remove it to obtain a green check: verify
+actual timely collection and scan completion under both timers before calling
+the deployment reliable. A FRESH check or accepted dispatch is not that proof.
 
 ## Failure behavior and revocation
 
