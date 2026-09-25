@@ -7,6 +7,29 @@ from scripts import collect_kalshi
 
 
 class PropTransportTests(unittest.TestCase):
+    def test_failure_diagnostic_redacts_response_and_request_details(self):
+        transport = props.OfficialTransport()
+        output = io.StringIO()
+        error = HTTPError("https://example.invalid/?secret=private", 403, "private response", {}, io.BytesIO(b"private token"))
+        with patch.object(props, "urlopen", side_effect=error), patch.object(props.sys, "stderr", output):
+            props.capture("NFL", transport)
+        self.assertIn('"code": "HTTP_403"', output.getvalue())
+        self.assertNotIn("private", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+    def test_snapshot_size_failure_is_distinct_from_upstream_denial(self):
+        class Fixture:
+            def get(self, path):
+                if path.startswith("/series/"):
+                    return {"series": {"public_document": "x" * 1000}}
+                return {"events": [], "milestones": []}
+        output = io.StringIO()
+        with patch.object(props, "MAX_BYTES", 1000), patch.object(props.sys, "stderr", output):
+            snapshot = props.capture("NFL", Fixture())
+        self.assertIn('"code": "OVERSIZED_SNAPSHOT"', output.getvalue())
+        self.assertTrue(all(entry.get("error") == "UPSTREAM_UNAVAILABLE" for entry in snapshot["series"]))
+
     def test_failure_stops_provider_calls_across_sports(self):
         transport = props.OfficialTransport()
         with patch.object(props, "urlopen", side_effect=HTTPError("test", 429, "limited", {"Retry-After": "3600"}, io.BytesIO())) as opened:

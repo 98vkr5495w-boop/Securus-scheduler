@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import sys
 import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,11 @@ SERIES = {
     "NFL": ("KXNFLPASSYDS", "KXNFLRSHYDS", "KXNFLRECYDS", "KXNFLREC", "KXNFLPASSTDS"),
 }
 MAX_BYTES = 8_000_000
+
+
+def diagnostic(stage, code, **counts):
+    """Only fixed transport codes and public-response counts; never exception text."""
+    print(json.dumps({"source": "kalshi-props", "stage": stage, "code": code, **counts}), file=sys.stderr)
 
 
 class OfficialTransport:
@@ -43,10 +49,13 @@ class OfficialTransport:
                 if not isinstance(data, dict):
                     raise ValueError("invalid upstream document")
                 return data
-        except Exception:
+        except Exception as error:
             # A rate limit or other failure stops provider requests for the rest
             # of this cycle, across both sports. Never switch hosts or identities.
             self.blocked = True
+            endpoint = "events" if path.startswith("/events?") else "targets" if path.startswith("/structured_targets?") else "series"
+            code = f"HTTP_{error.code}" if isinstance(error, HTTPError) else "TIMEOUT" if isinstance(error, TimeoutError) else "NETWORK" if isinstance(error, URLError) else "OVERSIZED_DOCUMENT" if isinstance(error, ValueError) and str(error) == "oversized upstream document" else "INVALID_DOCUMENT"
+            diagnostic(endpoint, code)
             raise
 
 
@@ -89,7 +98,9 @@ def capture(sport, transport):
     except Exception:
         entries = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
     payload = {"sport": sport, "capturedAt": captured_at, "series": entries}
-    if len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_BYTES:
+    payload_bytes = len(json.dumps(payload, separators=(",", ":")).encode())
+    if payload_bytes > MAX_BYTES:
+        diagnostic("snapshot", "OVERSIZED_SNAPSHOT", sport=sport, bytes=payload_bytes)
         payload["series"] = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
     return payload
 
