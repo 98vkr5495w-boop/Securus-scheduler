@@ -195,6 +195,30 @@ def storage_maintenance_in_cooldown(payload: dict[str, Any], now: datetime) -> b
     return latest is not None and now - latest < timedelta(minutes=RETRY_COOLDOWN_MINUTES)
 
 
+def completed_independent_cleanup_allows_collection(payload: dict[str, Any], now: datetime) -> bool:
+    """A successful ten-minute cleanup must not indefinitely postpone fresh feeds.
+
+    This exception applies only to full collection with measured NORMAL storage
+    and an explicit completed independent receipt. Maintenance-only recovery and
+    the separate collector/job retry cooldown keep their existing bounds.
+    """
+    capacity = (payload.get("storage") or {}).get("capacity") or {}
+    receipt = (capacity.get("archives") or {}).get("lastMaintenance") or {}
+    utilization = capacity.get("utilizationPercent")
+    started = parse_timestamp(receipt.get("startedAt"))
+    completed = parse_timestamp(receipt.get("completedAt"))
+    return (
+        capacity.get("capacityState") == "NORMAL"
+        and capacity.get("maintenanceState") == "NORMAL"
+        and type(utilization) in (int, float) and math.isfinite(utilization)
+        and 0 <= utilization < 75
+        and receipt.get("triggerName") == "cloudflare-cron-10m"
+        and receipt.get("status") == "SUCCEEDED" and not receipt.get("error")
+        and started is not None and completed is not None
+        and started <= completed <= now
+    )
+
+
 def collection_in_progress(payload: dict[str, Any], now: datetime | None = None) -> bool:
     """True only for a RUNNING receipt young enough to still be a live worker.
 
@@ -364,7 +388,7 @@ def scheduler_is_due(
                 return False, "frequent feeds are under 30 minutes old and deep feeds are within their six-hour cadence"
         except Exception:
             return False, "live source timestamps and storage could not be verified; recovery deferred, not confirmed healthy"
-        if storage_maintenance_in_cooldown(payload, now):
+        if storage_maintenance_in_cooldown(payload, now) and not completed_independent_cleanup_allows_collection(payload, now):
             return False, f"{reason}; storage maintenance is within the bounded 10-minute retry cooldown; readiness remains fail-closed"
         if github_error:
             # In particular, do not recursively dispatch on every completion

@@ -211,6 +211,37 @@ class SchedulerDueTests(unittest.TestCase):
             now=now, source_get=lambda: state, exclude_run_id=42)
         self.assertTrue(due)
 
+    def test_completed_ten_minute_cleanup_cannot_starve_due_feeds_with_normal_storage(self):
+        for elapsed in (0, 10, 20):
+            now = CYCLE + timedelta(hours=3, minutes=elapsed)
+            state = self.sources(now, 60)
+            state["storage"]["capacity"] = {
+                "capacityState": "NORMAL", "maintenanceState": "NORMAL", "utilizationPercent": 34,
+                "archives": {"lastMaintenance": {
+                    "triggerName": "cloudflare-cron-10m", "status": "SUCCEEDED", "error": None,
+                    "startedAt": format_cycle_key(now - timedelta(minutes=2)),
+                    "completedAt": format_cycle_key(now - timedelta(minutes=1)),
+                }},
+            }
+            calls = []
+            due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
+                "owner/repo", "securus-scheduler.yml", "main", cycle_start(now), now=now,
+                source_get=lambda: state)
+            self.assertTrue(due, reason)
+            self.assertEqual(len(calls), 1)
+            self.assertNotEqual(calls[0]["payload"]["inputs"].get("maintenance_only"), "true")
+            for status in ("RUNNING", "FAILED", None):
+                state["storage"]["capacity"]["archives"]["lastMaintenance"]["status"] = status
+                due, _ = scheduler_is_due(fake_api(), "owner/repo", "securus-scheduler.yml", "main",
+                    cycle_start(now), now=now, source_get=lambda: state)
+                self.assertFalse(due, "unfinished, failed or unknown maintenance still honors cooldown")
+            receipt = state["storage"]["capacity"]["archives"]["lastMaintenance"]
+            receipt["status"] = "SUCCEEDED"
+            state["storage"]["capacity"].update(capacityState="WARNING", utilizationPercent=78)
+            due, _ = scheduler_is_due(fake_api(), "owner/repo", "securus-scheduler.yml", "main",
+                cycle_start(now), now=now, source_get=lambda: state)
+            self.assertFalse(due, "storage under pressure keeps its maintenance cooldown")
+
     def test_external_maintenance_receipt_still_blocks_current_cadence_run(self):
         now = CYCLE + timedelta(hours=3)
         state = self.sources(now, 60)
