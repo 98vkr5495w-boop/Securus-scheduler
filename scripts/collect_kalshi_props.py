@@ -59,12 +59,15 @@ class OfficialTransport:
             raise
 
 
-def capture(sport, transport):
+def capture(sport, transport, series_ticker=None):
+    if series_ticker is not None and series_ticker not in SERIES[sport]:
+        raise ValueError("unsupported series")
+    requested_series = (series_ticker,) if series_ticker else SERIES[sport]
     captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     entries = []
     targets = set()
     target_ids_by_ticker = {}
-    for ticker in SERIES[sport]:
+    for ticker in requested_series:
         try:
             series = transport.get("/series/" + ticker)
             events = transport.get("/events?" + urlencode({
@@ -98,22 +101,20 @@ def capture(sport, transport):
             documents.extend(data["structured_targets"])
         for entry in entries:
             if "error" not in entry:
-                # Keep each envelope self-contained as required by the private
-                # parser, but do not duplicate every sport target into every
-                # series. The NFL slate is large enough that the old cross-
-                # product exceeded the fixed 8 MB authenticated route limit.
                 ids = target_ids_by_ticker.get(entry["ticker"], set())
                 entry["targets"] = {"structured_targets": [
                     document for document in documents
                     if isinstance(document, dict) and str(document.get("id")) in ids
                 ]}
     except Exception:
-        entries = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
+        entries = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in requested_series]
     payload = {"sport": sport, "capturedAt": captured_at, "series": entries}
+    if series_ticker:
+        payload["scope"] = "SERIES"
     payload_bytes = len(json.dumps(payload, separators=(",", ":")).encode())
     if payload_bytes > MAX_BYTES:
         diagnostic("snapshot", "OVERSIZED_SNAPSHOT", sport=sport, bytes=payload_bytes)
-        payload["series"] = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
+        payload["series"] = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in requested_series]
     return payload
 
 
@@ -121,15 +122,19 @@ def main():
     transport = OfficialTransport()
     failed = False
     for sport in SERIES:
-        try:
-            payload = capture(sport, transport)
-            result = securus_post("/api/kalshi-props-ingest", payload, timeout=90, attempts=1)
-            ok = result.get("accepted") is True and len(result.get("results", [])) == 1 and result["results"][0].get("status") == "SUCCEEDED"
-            failed |= not ok
-            print(json.dumps({"source": "kalshi-props", "sport": sport, "status": "SUCCEEDED" if ok else "FAILED"}))
-        except Exception:
-            failed = True
-            print(json.dumps({"source": "kalshi-props", "sport": sport, "status": "FAILED"}))
+        for ticker in SERIES[sport]:
+            try:
+                # Send each original series envelope separately, including only
+                # its own referenced targets. The receiver's 8 MB bound and the
+                # real capture time remain unchanged; there is no full-slate POST.
+                payload = capture(sport, transport, ticker)
+                result = securus_post("/api/kalshi-props-ingest", payload, timeout=90, attempts=1)
+                ok = result.get("accepted") is True and len(result.get("results", [])) == 1 and result["results"][0].get("status") == "SUCCEEDED"
+                failed |= not ok
+                print(json.dumps({"source": "kalshi-props", "sport": sport, "series": ticker, "status": "SUCCEEDED" if ok else "FAILED"}))
+            except Exception:
+                failed = True
+                print(json.dumps({"source": "kalshi-props", "sport": sport, "series": ticker, "status": "FAILED"}))
     return 1 if failed else 0
 
 

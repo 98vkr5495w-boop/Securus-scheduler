@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -8,6 +9,42 @@ from scripts import collect_kalshi
 
 
 class PropTransportTests(unittest.TestCase):
+    def test_large_combined_nfl_slate_fits_separate_bounded_series_envelopes(self):
+        class Fixture:
+            def get(self, path):
+                if path.startswith("/series/"):
+                    return {"series": {"public_document": "x" * 1_700_000}}
+                return {"events": [], "milestones": []}
+        transport = Fixture()
+        combined = props.capture("NFL", transport)
+        self.assertTrue(all(entry.get("error") for entry in combined["series"]))
+        snapshots = [props.capture("NFL", transport, ticker) for ticker in props.SERIES["NFL"]]
+        self.assertEqual(len(snapshots), 5)
+        for ticker, snapshot in zip(props.SERIES["NFL"], snapshots):
+            self.assertEqual(snapshot["scope"], "SERIES")
+            self.assertEqual([entry["ticker"] for entry in snapshot["series"]], [ticker])
+            self.assertNotIn("error", snapshot["series"][0])
+            self.assertLess(len(json.dumps(snapshot).encode()), props.MAX_BYTES)
+        with self.assertRaises(ValueError):
+            props.capture("NFL", transport, "UNKNOWN")
+
+    def test_main_delivers_all_seven_independent_series_once_without_retry(self):
+        calls = []
+        class Fixture:
+            def get(self, path):
+                if path.startswith("/series/"):
+                    return {"series": {"fee_type": "quadratic", "fee_multiplier": 1}}
+                return {"events": [], "milestones": []}
+        def post(path, payload, **options):
+            calls.append(payload)
+            self.assertEqual(path, "/api/kalshi-props-ingest")
+            self.assertEqual(options["attempts"], 1)
+            return {"accepted": True, "results": [{"status": "SUCCEEDED"}]}
+        with patch.object(props, "OfficialTransport", return_value=Fixture()), patch.object(props, "securus_post", side_effect=post), patch.object(props.sys, "stdout", io.StringIO()):
+            self.assertEqual(props.main(), 0)
+        self.assertEqual([p["series"][0]["ticker"] for p in calls], [ticker for values in props.SERIES.values() for ticker in values])
+        self.assertTrue(all(p["scope"] == "SERIES" for p in calls))
+
     def test_failure_diagnostic_redacts_response_and_request_details(self):
         transport = props.OfficialTransport()
         output = io.StringIO()
