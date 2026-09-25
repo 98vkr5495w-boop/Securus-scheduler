@@ -2,6 +2,7 @@ import io
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 from scripts import collect_kalshi_props as props
 from scripts import collect_kalshi
 
@@ -54,6 +55,36 @@ class PropTransportTests(unittest.TestCase):
         self.assertIn("ids=a", transport.query)
         self.assertEqual(snapshot["series"][0]["targets"]["structured_targets"][0]["name"], "Fixture Player")
         self.assertNotIn("verified", str(snapshot))
+
+    def test_structured_targets_are_partitioned_by_series(self):
+        class Fixture:
+            def get(self, path):
+                if path.startswith("/series/"):
+                    return {"series": {"fee_type": "quadratic", "fee_multiplier": 1}}
+                if path.startswith("/events?"):
+                    ticker = parse_qs(urlparse(path).query)["series_ticker"][0]
+                    player, team, opponent = ticker + "-player", ticker + "-team", ticker + "-opponent"
+                    return {
+                        "events": [{"markets": [{"custom_strike": {
+                            "football_player": player, "football_team": team,
+                        }}]}],
+                        "milestones": [{"details": {
+                            "home_team_id": team, "away_team_id": opponent,
+                        }}],
+                    }
+                ids = parse_qs(urlparse(path).query).get("ids", [])
+                return {"structured_targets": [{"id": target, "name": target} for target in ids]}
+
+        snapshot = props.capture("NFL", Fixture())
+        self.assertTrue(all("error" not in entry for entry in snapshot["series"]))
+        for entry in snapshot["series"]:
+            expected = {
+                entry["ticker"] + "-player",
+                entry["ticker"] + "-team",
+                entry["ticker"] + "-opponent",
+            }
+            actual = {target["id"] for target in entry["targets"]["structured_targets"]}
+            self.assertEqual(actual, expected)
 
     def test_generic_cycle_does_not_poll_mlb_props_twice(self):
         with patch.dict(collect_kalshi.os.environ, {"KALSHI_PROPS_TRANSPORT": "separate"}), patch.object(collect_kalshi, "collect_series", return_value=([], [], [])) as collect:
