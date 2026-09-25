@@ -63,6 +63,7 @@ def capture(sport, transport):
     captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     entries = []
     targets = set()
+    target_ids_by_ticker = {}
     for ticker in SERIES[sport]:
         try:
             series = transport.get("/series/" + ticker)
@@ -72,14 +73,17 @@ def capture(sport, transport):
             }))
             if not isinstance(events.get("events"), list) or not isinstance(events.get("milestones"), list):
                 raise ValueError("missing official event envelope")
+            entry_targets = set()
             for milestone in events["milestones"]:
                 details = milestone.get("details") or {}
-                targets.update(str(details[key]) for key in ("away_team_id", "home_team_id") if details.get(key))
+                entry_targets.update(str(details[key]) for key in ("away_team_id", "home_team_id") if details.get(key))
             for event in events["events"]:
                 for market in event.get("markets", []):
                     strike = market.get("custom_strike") or {}
                     prefix = "baseball" if sport == "MLB" else "football"
-                    targets.update(str(strike[key]) for key in (prefix + "_player", prefix + "_team") if strike.get(key))
+                    entry_targets.update(str(strike[key]) for key in (prefix + "_player", prefix + "_team") if strike.get(key))
+            targets.update(entry_targets)
+            target_ids_by_ticker[ticker] = entry_targets
             entries.append({"ticker": ticker, "series": series, "events": events})
         except Exception:
             entries.append({"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"})
@@ -94,7 +98,15 @@ def capture(sport, transport):
             documents.extend(data["structured_targets"])
         for entry in entries:
             if "error" not in entry:
-                entry["targets"] = {"structured_targets": documents}
+                # Keep each envelope self-contained as required by the private
+                # parser, but do not duplicate every sport target into every
+                # series. The NFL slate is large enough that the old cross-
+                # product exceeded the fixed 8 MB authenticated route limit.
+                ids = target_ids_by_ticker.get(entry["ticker"], set())
+                entry["targets"] = {"structured_targets": [
+                    document for document in documents
+                    if isinstance(document, dict) and str(document.get("id")) in ids
+                ]}
     except Exception:
         entries = [{"ticker": ticker, "error": "UPSTREAM_UNAVAILABLE"} for ticker in SERIES[sport]]
     payload = {"sport": sport, "capturedAt": captured_at, "series": entries}
