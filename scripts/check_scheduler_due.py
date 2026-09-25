@@ -19,6 +19,7 @@ COLLECT_JOB_NAME = "collect-inputs"
 SCHEDULE_OFFSET_MINUTES = 7
 REFRESH_MINUTES = 30
 RETRY_COOLDOWN_MINUTES = 10
+SCHEDULE_EARLY_GRACE_MINUTES = 2
 # Securus projects a collector journal as abandoned 15 minutes after its start
 # when no live lease remains, and unconditionally after 30 minutes. A RUNNING
 # receipt older than this can never be a live worker; treating it as "in
@@ -53,12 +54,22 @@ def cycle_start(now: datetime) -> datetime:
 
 
 def latest_slot(now: datetime, minute: int) -> datetime:
-    """Return the most recent UTC occurrence of an explicit cron minute."""
+    """Resolve an explicit cron slot, tolerating bounded early delivery.
+
+    GitHub delivered the 2026-09-25 14:07 UTC slot at 14:06:38. Treating that
+    as the prior :07 slot promoted it to :37 and made a valid half-hour cycle
+    look already complete. A slot may therefore be slightly in the future,
+    but never beyond this narrow platform-delivery allowance.
+    """
     if minute not in (7, 37):
         raise ValueError("cycle minute must be 7 or 37")
     current = now.astimezone(timezone.utc)
     candidate = current.replace(minute=minute, second=0, microsecond=0)
-    return candidate if candidate <= current else candidate - timedelta(hours=1)
+    if candidate <= current:
+        return candidate
+    if candidate - current <= timedelta(minutes=SCHEDULE_EARLY_GRACE_MINUTES):
+        return candidate
+    return candidate - timedelta(hours=1)
 
 
 def cycle_after_grace(now: datetime, grace_minutes: int) -> datetime:
@@ -293,6 +304,30 @@ def sources_due(payload: dict[str, Any], now: datetime, sources: frozenset[str],
     return False
 
 
+def sources_predate_cycle(
+    payload: dict[str, Any], boundary: datetime, sources: frozenset[str]
+) -> bool:
+    """True until every required feed has completed for this canonical slot.
+
+    Completion-time age alone drifts with runtime: a :37 collection finishing
+    at :41 is only 26 minutes old at :07, so the next scheduled cycle used to
+    skip and turn a 30-minute cadence into an hourly cadence. Canonical cycle
+    coverage preserves idempotency without shortening freshness safeguards.
+    """
+    rows = payload.get("sources")
+    if not isinstance(rows, list):
+        return True
+    runs = {row.get("id"): row.get("lastRun") for row in rows if isinstance(row, dict)}
+    for source in sources:
+        run = runs.get(source)
+        if not isinstance(run, dict) or run.get("status") != "SUCCEEDED":
+            return True
+        completed = parse_timestamp(run.get("completedAt"))
+        if completed is None or completed < boundary.astimezone(timezone.utc):
+            return True
+    return False
+
+
 def deep_refresh_due(payload: dict[str, Any], now: datetime) -> bool:
     # Preserve the six-hour deep cadence even when a delayed/skipped :07 slot
     # shifts collection to :37. Daily inputs must not starve behind fresh odds.
@@ -339,6 +374,9 @@ def effective_cycle(requested: datetime, now: datetime) -> datetime:
     """A delayed trigger must service now, not replay an already finished slot."""
     current = cycle_start(now)
     if requested > current:
+        if (requested - now.astimezone(timezone.utc) <=
+                timedelta(minutes=SCHEDULE_EARLY_GRACE_MINUTES)):
+            return requested
         raise ValueError("cycle-key must not be in the future")
     return current
 
@@ -378,6 +416,8 @@ def scheduler_is_due(
                 reason = ("an abandoned collector receipt is older than the "
                           f"{ABANDONED_COLLECTION_MINUTES}-minute lease horizon ({', '.join(abandoned)}); "
                           "fresh collection is required")
+            elif sources_predate_cycle(payload, boundary, FREQUENT_SOURCES):
+                reason = "a frequent feed has not completed for the current canonical cycle"
             elif sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES):
                 reason = "a frequent feed is missing, failed, or due for its 30-minute refresh"
             elif deep_refresh_due(payload, now):

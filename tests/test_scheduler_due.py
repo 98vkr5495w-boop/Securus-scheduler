@@ -303,7 +303,7 @@ class SchedulerDueTests(unittest.TestCase):
 
     def test_warning_storage_gets_maintenance_even_with_fresh_feeds(self):
         now = CYCLE + timedelta(hours=3)
-        state = self.sources(now, 5)
+        state = self.sources(now, 0)
         state["storage"]["capacity"] = {"capacityState": "WARNING", "utilizationPercent": 83.8}
         calls = []
         due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
@@ -368,7 +368,7 @@ class SchedulerDueTests(unittest.TestCase):
                 self.assertIn(state["sources"][0]["id"], reason)
                 self.assertEqual(len(calls), 1)
                 self.assertNotIn("maintenance_only", calls[0]["payload"]["inputs"])
-        marker = self.sources(now, 5)
+        marker = self.sources(now, 0)
         marker["sources"].append({"id": "site-cron-recovery", "lastRun": {"status": "RUNNING",
             "startedAt": format_cycle_key(now - timedelta(minutes=1))}})
         self.assertFalse(collection_in_progress(marker, now),
@@ -487,6 +487,12 @@ class SchedulerDueTests(unittest.TestCase):
             "a delayed watchdog checks the newest cycle whose grace elapsed",
         )
 
+    def test_explicit_cron_slot_tolerates_observed_early_delivery(self):
+        now = datetime(2026, 9, 25, 14, 6, 38, tzinfo=timezone.utc)
+        slot = latest_slot(now, 7)
+        self.assertEqual(slot, datetime(2026, 9, 25, 14, 7, tzinfo=timezone.utc))
+        self.assertEqual(effective_cycle(slot, now), slot)
+
     def test_only_a_success_at_or_after_the_cycle_counts(self):
         before = fake_api(started_at="2026-09-03T05:06:59Z", completed_at="2026-09-03T05:06:59Z")
         boundary = fake_api(started_at="2026-09-03T05:07:00Z", completed_at="2026-09-03T05:07:00Z")
@@ -552,7 +558,7 @@ class SchedulerDueTests(unittest.TestCase):
     def test_fresh_feeds_cannot_hide_a_missing_or_stalled_paper_scan(self):
         now = CYCLE + timedelta(hours=3)
         for scan in [None, {}, {"runId": "old", "mode": "PAPER_ONLY", "completedAt": format_cycle_key(now - timedelta(minutes=61))}]:
-            state = self.sources(now, 5)
+            state = self.sources(now, 0)
             state["lastPaperScan"] = scan
             calls = []
             due, reason = recover_cycle(fake_api(), lambda *a, **kw: calls.append(kw),
@@ -578,7 +584,8 @@ class SchedulerDueTests(unittest.TestCase):
     def test_actual_sources_not_a_green_workflow_determine_refresh(self):
         now = CYCLE + timedelta(minutes=70)
         boundary = cycle_start(now)
-        for age, expected in [(0, False), (29, False), (30, True), (46, True), (-1, True)]:
+        for age, expected in [(0, False), (9, False), (10, False), (29, True),
+                              (30, True), (46, True), (-1, True)]:
             with self.subTest(age=age):
                 due, _ = scheduler_is_due(fake_api(), "owner/repo", "securus-scheduler.yml", "main",
                     boundary, now=now, source_get=lambda: self.sources(now, age))
@@ -587,6 +594,17 @@ class SchedulerDueTests(unittest.TestCase):
         payload["paperBetReadiness"] = {"status": "NO_BET", "readySports": []}
         self.assertFalse(source_refresh_due(payload, now),
             "a betting-policy abstention must never cause a collection retry storm")
+
+    def test_runtime_age_cannot_skip_the_next_canonical_cycle(self):
+        now = datetime(2026, 9, 25, 14, 7, 10, tzinfo=timezone.utc)
+        payload = self.sources(now, 28)
+        due, reason = scheduler_is_due(
+            fake_api(started_at="2026-09-25T13:37:10Z", completed_at="2026-09-25T13:41:00Z"),
+            "owner/repo", "securus-scheduler.yml", "main", cycle_start(now),
+            now=now, source_get=lambda: payload,
+        )
+        self.assertTrue(due)
+        self.assertIn("canonical cycle", reason)
 
     def test_missing_failed_and_incomplete_source_records_need_refresh(self):
         now = CYCLE + timedelta(minutes=70)
