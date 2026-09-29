@@ -119,6 +119,32 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertLess(scan_offset, surface_offset)
         self.assertIn("steps.nba_attestation.outcome == 'success'", self.final)
 
+    def test_deep_only_cycle_does_not_require_an_unrequested_nba_attestation(self):
+        self.assertIn(
+            "run_frequent: ${{ steps.cadence.outputs.run_frequent }}",
+            self.collect,
+        )
+        sentinel = self.final.split(
+            "Surface an unassessable NBA attestation", 1
+        )[1]
+        self.assertIn(
+            "needs.collect-inputs.outputs.run_frequent == 'false'",
+            sentinel,
+        )
+        self.assertIn("needs.verify-nba-pdf.result == 'skipped'", sentinel)
+        self.assertIn("steps.nba_attestation.outcome == 'skipped'", sentinel)
+
+    def test_post_collection_maintenance_fails_closed_at_critical_capacity(self):
+        post = self.collect.split(
+            "Recheck bounded storage after collection", 1
+        )[1]
+        self.assertIn("id: post_maintenance", post)
+        self.assertIn("continue-on-error: true", post)
+        self.assertIn("steps.post_maintenance.outcome != 'success'", post)
+        self.assertIn('request("/api/data-sources")', post)
+        self.assertIn('state == "CRITICAL" or percent >= 85', post)
+        self.assertIn("capacity(", post)
+
     def test_freshness_failure_is_surfaced_only_after_fail_closed_scan(self):
         freshness_offset = self.final.index(
             "Require fresh non-NBA decision inputs"

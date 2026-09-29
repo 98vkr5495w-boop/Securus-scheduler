@@ -188,6 +188,7 @@ jobs:
     env:
       SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
     outputs:
+      run_frequent: ${{ steps.cadence.outputs.run_frequent }}
       nba_attestation_required: ${{ steps.nba_challenge.outputs.required }}
       nba_attestation_challenge: ${{ steps.nba_challenge.outputs.challenge }}
 
@@ -391,7 +392,32 @@ jobs:
           fi
 
       - name: Recheck bounded storage after collection
+        id: post_maintenance
+        continue-on-error: true
         run: python scripts/maintain_storage.py --target-percent 84
+
+      - name: Fail closed unless transient maintenance left measured safe capacity
+        if: steps.post_maintenance.outcome != 'success'
+        shell: bash
+        run: |
+          python - <<'PY'
+          from scripts.maintain_storage import capacity, request
+
+          payload = request("/api/data-sources")
+          state, percent, actual = capacity(
+              (payload.get("storage") or {}).get("capacity")
+          )
+          if state == "CRITICAL" or percent >= 85:
+              raise SystemExit(
+                  "Post-collection maintenance failed and measured storage "
+                  f"is unsafe ({state}, {percent:.2f}%); scan blocked"
+              )
+          print(
+              "::warning::Post-collection maintenance did not complete, but "
+              f"a new public measurement is below the critical boundary "
+              f"({actual} bytes, {percent:.2f}%)."
+          )
+          PY
 
   verify-nba-pdf:
     needs: collect-inputs
@@ -540,6 +566,9 @@ jobs:
           always() &&
           (
             !(
+              (needs.collect-inputs.outputs.run_frequent == 'false' &&
+               needs.verify-nba-pdf.result == 'skipped' &&
+               steps.nba_attestation.outcome == 'skipped') ||
               (needs.collect-inputs.outputs.nba_attestation_required == 'false' &&
                needs.verify-nba-pdf.result == 'skipped' &&
                steps.nba_attestation.outcome == 'skipped') ||
