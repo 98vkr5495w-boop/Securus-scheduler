@@ -353,6 +353,41 @@ def paper_scan_due(payload: dict[str, Any], now: datetime) -> bool:
     return completed is None or not timedelta(0) <= now - completed < timedelta(minutes=60)
 
 
+def current_cycle_completed(
+    payload: dict[str, Any],
+    boundary: datetime,
+    now: datetime,
+    collection_completed_at: datetime | None,
+) -> bool:
+    """Accept a trusted cycle that straddled its canonical boundary.
+
+    GitHub can start a delayed :07/:37 run seconds before the nominal boundary.
+    Individual collectors may then finish on both sides of that boundary even
+    though the trusted collect-inputs job and journaled paper scan finish after
+    it.  Requiring every source timestamp to be after the boundary makes the
+    workflow_run watchdog report a false DEFERRED failure for that completed
+    cycle.  This exception stays fail-closed: current-cycle GitHub completion,
+    a current-cycle journaled scan, fresh frequent feeds, and fresh deep feeds
+    must all agree.
+    """
+    boundary = boundary.astimezone(timezone.utc)
+    now = now.astimezone(timezone.utc)
+    if (collection_completed_at is None or
+            not boundary <= collection_completed_at <= now):
+        return False
+    scan = payload.get("lastPaperScan")
+    if (not isinstance(scan, dict) or scan.get("mode") != "PAPER_ONLY" or
+            not scan.get("runId")):
+        return False
+    scan_completed_at = parse_timestamp(scan.get("completedAt"))
+    if scan_completed_at is None or not boundary <= scan_completed_at <= now:
+        return False
+    return (
+        not sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES)
+        and not deep_refresh_due(payload, now)
+    )
+
+
 def read_public_source_status() -> dict[str, Any]:
     # Never send the GitHub credential to Securus or log this response body.
     request = Request(PUBLIC_SOURCE_URL, headers={
@@ -416,6 +451,11 @@ def scheduler_is_due(
                 reason = ("an abandoned collector receipt is older than the "
                           f"{ABANDONED_COLLECTION_MINUTES}-minute lease horizon ({', '.join(abandoned)}); "
                           "fresh collection is required")
+            elif current_cycle_completed(payload, boundary, now, completed_at):
+                return False, (
+                    f"cycle {format_cycle_key(boundary)} completed at "
+                    f"{format_cycle_key(completed_at)} with a verified paper scan"
+                )
             elif sources_predate_cycle(payload, boundary, FREQUENT_SOURCES):
                 reason = "a frequent feed has not completed for the current canonical cycle"
             elif sources_due(payload, now, FREQUENT_SOURCES, REFRESH_MINUTES):

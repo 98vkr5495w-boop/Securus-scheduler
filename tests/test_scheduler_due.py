@@ -606,6 +606,48 @@ class SchedulerDueTests(unittest.TestCase):
         self.assertTrue(due)
         self.assertIn("canonical cycle", reason)
 
+    def test_straddling_cycle_is_fresh_only_after_collection_and_verified_scan(self):
+        boundary = datetime(2026, 9, 30, 19, 7, tzinfo=timezone.utc)
+        now = boundary + timedelta(minutes=1, seconds=57)
+        payload = self.sources(now, 2)
+        payload["lastPaperScan"] = {
+            "runId": "verified-straddling-scan",
+            "mode": "PAPER_ONLY",
+            "completedAt": format_cycle_key(boundary + timedelta(minutes=1, seconds=30)),
+        }
+        history = fake_api(
+            started_at=format_cycle_key(boundary - timedelta(seconds=8)),
+            completed_at=format_cycle_key(boundary + timedelta(minutes=1, seconds=20)),
+        )
+
+        due, reason = scheduler_is_due(
+            history, "owner/repo", "securus-scheduler.yml", "main", boundary,
+            now=now, source_get=lambda: payload,
+        )
+        self.assertFalse(due)
+        self.assertIn("verified paper scan", reason)
+        self.assertEqual(gate_state(due, reason), "FRESH")
+
+        for collection_completed, scan_completed in [
+            (boundary - timedelta(seconds=1), boundary + timedelta(minutes=1)),
+            (boundary + timedelta(minutes=1), boundary - timedelta(seconds=1)),
+        ]:
+            with self.subTest(collection_completed=collection_completed,
+                              scan_completed=scan_completed):
+                payload["lastPaperScan"]["completedAt"] = format_cycle_key(scan_completed)
+                stale_history = fake_api(
+                    started_at=format_cycle_key(boundary - timedelta(seconds=8)),
+                    completed_at=format_cycle_key(collection_completed),
+                )
+                due, reason = scheduler_is_due(
+                    stale_history, "owner/repo", "securus-scheduler.yml", "main", boundary,
+                    now=now, source_get=lambda: payload,
+                )
+                self.assertFalse(due)
+                self.assertIn("canonical cycle", reason)
+                self.assertIn("cooldown", reason)
+                self.assertEqual(gate_state(due, reason), "DEFERRED")
+
     def test_missing_failed_and_incomplete_source_records_need_refresh(self):
         now = CYCLE + timedelta(minutes=70)
         for payload in [{}, {"sources": None}, {"sources": []},
