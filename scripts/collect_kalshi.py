@@ -396,6 +396,7 @@ def market_metadata(
         if market.get("volume_fp") is not None
         else as_float(market.get("volume")),
         "functionalStrike": str(market.get("functional_strike") or ""),
+        "strikeType": str(market.get("strike_type") or ""),
         "floorStrike": as_float(market.get("floor_strike")),
         "capStrike": as_float(market.get("cap_strike")),
         "primaryParticipantKey": str(market.get("primary_participant_key") or ""),
