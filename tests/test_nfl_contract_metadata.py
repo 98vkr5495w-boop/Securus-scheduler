@@ -32,3 +32,17 @@ class NflContractMetadataTests(unittest.TestCase):
         self.assertEqual(data["rulesPrimary"], "")
         self.assertEqual(data["rulesSecondary"], "")
         self.assertIsNone(data["settlementValueDollars"])
+        self.assertEqual(data["strikeType"], "")
+
+    def test_official_threshold_type_survives_for_each_listed_alternate(self):
+        for series, family in [("KXMLBSPREAD", "spread"), ("KXMLBTOTAL", "game_total"),
+                               ("KXNFLSPREAD", "spread"), ("KXNFLTOTAL", "game_total")]:
+            for strike in [1.5, 2.5, 3.5]:
+                data = market_metadata({"ticker": f"{series}-GAME-{strike}",
+                    "strike_type": "greater", "floor_strike": strike,
+                    "yes_ask_dollars": "0.4200", "no_ask_dollars": "0.5900"}, {},
+                    {"ticker": series, "market_family": family}, "open", "quadratic", 1)
+                self.assertEqual(data["strikeType"], "greater")
+                self.assertEqual(data["floorStrike"], strike)
+                self.assertEqual(data["functionalStrike"], "")
+                self.assertEqual(data["yesAskDollars"], .42)
