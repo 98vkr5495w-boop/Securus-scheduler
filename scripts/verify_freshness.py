@@ -26,6 +26,16 @@ MAX_AGE_MINUTES = {
 }
 
 
+def nba_reporting_inactive(now: datetime) -> bool:
+    eastern = now.astimezone(ZoneInfo("America/New_York"))
+    # NBA's verified 2026-27 opener is October 20. Collect from October 19
+    # for opening-night reports. Unknown future seasons keep strict checks.
+    # https://pr.nba.com/2026-27-nba-regular-season-schedule/
+    return eastern.month in (8, 9) or (
+        eastern.year == 2026 and eastern.month == 10 and eastern.day < 19
+    )
+
+
 def parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -115,7 +125,7 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     wanted = set(args.sources or MAX_AGE_MINUTES)
-    if now.astimezone(ZoneInfo("America/New_York")).month in (8, 9):
+    if nba_reporting_inactive(now):
         wanted.difference_update({"nba-stats", "nba-official-injuries"})
     failures = verify_with_rechecks(lambda: read_status(args.url), wanted)
 

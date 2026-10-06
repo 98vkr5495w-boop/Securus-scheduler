@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import unittest
 
-from scripts.verify_freshness import freshness_failures, verify_with_rechecks
+from scripts.verify_freshness import freshness_failures, verify_with_rechecks, nba_reporting_inactive
 
 
 NOW = datetime(2026, 10, 1, 16, 0, tzinfo=timezone.utc)
@@ -22,6 +22,16 @@ def payload(records_written):
 
 
 class FreshnessTests(unittest.TestCase):
+    def test_verified_preseason_window_ends_before_opening_night(self):
+        for stamp, inactive in [
+            ("2026-10-06T20:00:00+00:00", True),
+            ("2026-10-19T03:59:59+00:00", True),
+            ("2026-10-19T04:00:00+00:00", False),
+            ("2026-10-20T04:00:00+00:00", False),
+            ("2027-10-06T20:00:00+00:00", False),
+        ]:
+            self.assertEqual(nba_reporting_inactive(datetime.fromisoformat(stamp)), inactive)
+
     def test_cached_stale_snapshot_rechecks_without_changing_age_budget(self):
         stale = payload(1)
         stale["sources"][0]["id"] = "climate"
