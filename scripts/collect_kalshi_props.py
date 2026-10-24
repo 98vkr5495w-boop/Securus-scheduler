@@ -20,6 +20,7 @@ else:
 SERIES = {
     "MLB": ("KXMLBKS", "KXMLBHR"),
     "NFL": ("KXNFLPASSYDS", "KXNFLRSHYDS", "KXNFLRECYDS", "KXNFLREC", "KXNFLPASSTDS"),
+    "NBA": ("KXNBAPTS", "KXNBAREB", "KXNBAAST"),
 }
 MAX_BYTES = 8_000_000
 
@@ -83,7 +84,7 @@ def capture(sport, transport, series_ticker=None):
             for event in events["events"]:
                 for market in event.get("markets", []):
                     strike = market.get("custom_strike") or {}
-                    prefix = "baseball" if sport == "MLB" else "football"
+                    prefix = "baseball" if sport == "MLB" else "basketball" if sport == "NBA" else "football"
                     entry_targets.update(str(strike[key]) for key in (prefix + "_player", prefix + "_team") if strike.get(key))
             targets.update(entry_targets)
             target_ids_by_ticker[ticker] = entry_targets

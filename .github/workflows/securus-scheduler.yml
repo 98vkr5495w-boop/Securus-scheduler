@@ -28,6 +28,7 @@ on:
     paths:
       - .github/workflows/securus-scheduler.yml
       - scripts/collect_source.sh
+      - scripts/collect_nba.py
       - scripts/collect_weather.py
       - scripts/collect_kalshi.py
       - scripts/collect_kalshi_props.py
@@ -65,6 +66,7 @@ jobs:
       - name: Validate public scripts
         run: |
           python -m py_compile \
+            scripts/collect_nba.py \
             scripts/collect_weather.py \
             scripts/collect_kalshi.py \
             scripts/collect_kalshi_props.py \
@@ -247,7 +249,7 @@ jobs:
         run: |
           set -u
           failures=()
-          for source in mlb-stats-api action-network sleeper-nfl nba-stats; do
+          for source in mlb-stats-api action-network sleeper-nfl; do
             if ! bash scripts/collect_source.sh "mode=fast&source=$source"; then
               failures+=("$source")
             fi
@@ -275,6 +277,21 @@ jobs:
           done
           if ((${#failures[@]})); then
             echo "::warning::Optional research feeds were not refreshed: ${failures[*]}"
+            exit 1
+          fi
+
+      - name: Transport official NBA scoreboard
+        if: steps.cadence.outputs.run_frequent == 'true'
+        id: nba_scoreboard
+        continue-on-error: true
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_collect.outputs.token }}
+        shell: bash
+        run: |
+          if ! python scripts/collect_nba.py; then
+            # The original collector journals the failure and refreshes the
+            # independent statistics model. It never relaxes the NBA gate.
+            bash scripts/collect_source.sh "mode=fast&source=nba-stats"
             exit 1
           fi
 
