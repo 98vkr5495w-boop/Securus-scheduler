@@ -42,6 +42,7 @@ ATTESTATION_PATH = "/api/nba-injury-attestation"
 PARSER_ID = "poppler-pdftotext-layout-v1"
 SCHEMA_VERSION = 2
 VERIFIER_VERSION = "securus-nba-completeness-v2"
+SUPPORTED_VERSIONS = {2: VERIFIER_VERSION, 3: "securus-nba-completeness-v3"}
 PDF_HOST = "ak-static.cms.nba.com"
 MAX_JSON_BYTES = 64 * 1024
 MIN_PDF_BYTES = 8 * 1024
@@ -243,13 +244,13 @@ def validate_challenge(payload: dict[str, Any]) -> dict[str, Any]:
     if not required:
         return {"required": False}
 
-    if payload.get("schemaVersion") != SCHEMA_VERSION:
+    if payload.get("schemaVersion") not in SUPPORTED_VERSIONS:
         raise AttestationError(
             f"challenge.schemaVersion must be {SCHEMA_VERSION}"
         )
 
     verifier_version = payload.get("verifierVersion")
-    if verifier_version != VERIFIER_VERSION:
+    if verifier_version != SUPPORTED_VERSIONS[payload["schemaVersion"]]:
         raise AttestationError("challenge.verifierVersion is invalid")
     target = payload.get("target")
     if not isinstance(target, dict):
@@ -306,7 +307,7 @@ def validate_challenge(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "required": True,
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": payload["schemaVersion"],
         "verifierVersion": verifier_version,
         "target": normalized_target,
     }
@@ -336,16 +337,18 @@ def validate_attestation(payload: dict[str, Any]) -> dict[str, Any]:
         "notYetSubmittedCount",
         "textBytes",
     }
+    if payload.get("schemaVersion") == 3:
+        expected_keys.add("matchupEvidence")
     if set(payload) != expected_keys:
         raise AttestationError(
             f"attestation fields do not match schema version {SCHEMA_VERSION}"
         )
-    if payload.get("schemaVersion") != SCHEMA_VERSION:
+    if payload.get("schemaVersion") not in SUPPORTED_VERSIONS:
         raise AttestationError(
             f"attestation.schemaVersion must be {SCHEMA_VERSION}"
         )
     verifier_version = payload.get("verifierVersion")
-    if verifier_version != VERIFIER_VERSION:
+    if verifier_version != SUPPORTED_VERSIONS[payload["schemaVersion"]]:
         raise AttestationError("attestation.verifierVersion is invalid")
 
     report_date = _parse_date(payload.get("reportDate"), "attestation.reportDate")
@@ -425,6 +428,28 @@ def validate_attestation(payload: dict[str, Any]) -> dict[str, Any]:
         )
     ):
         raise AttestationError("failed extraction must not claim parsed evidence")
+    if payload["schemaVersion"] == 3:
+        rows = payload["matchupEvidence"]
+        if not isinstance(rows, list) or len(rows) != len(reported_matchups):
+            raise AttestationError("matchupEvidence must cover the full reported slate")
+        if [row.get("matchup") if isinstance(row, dict) else None for row in rows] != reported_matchups:
+            raise AttestationError("matchupEvidence identities must match sorted reportedMatchups")
+        submitted = True
+        not_submitted = 0
+        for row in rows:
+            if set(row) != {"matchup", "teams"} or not isinstance(row["teams"], list) or len(row["teams"]) != 2:
+                raise AttestationError("invalid matchupEvidence fields")
+            for code, team in zip(row["matchup"].split("@"), row["teams"]):
+                if not isinstance(team, dict) or set(team) != {"team", "submission", "blockVerified"} or team["team"] != code or team["submission"] not in ("SUBMITTED", "NOT_YET_SUBMITTED", "UNKNOWN") or not isinstance(team["blockVerified"], bool):
+                    raise AttestationError("invalid exact team evidence")
+                if (team["submission"] == "UNKNOWN") == team["blockVerified"]:
+                    raise AttestationError("unknown team blocks cannot be verified")
+                submitted = submitted and team["submission"] == "SUBMITTED" and team["blockVerified"]
+                not_submitted += team["submission"] == "NOT_YET_SUBMITTED"
+        if payload["teamBlocksComplete"] != bool(rows and submitted) or not_submitted != payload["notYetSubmittedCount"]:
+            raise AttestationError("global team findings contradict per-team evidence")
+        if not payload["extractionSucceeded"] and rows:
+            raise AttestationError("failed extraction cannot claim team evidence")
     return payload
 
 
@@ -462,8 +487,12 @@ def site_request_json(
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
+    # Explicit capability negotiation keeps older scheduled verifiers on v2.
+    # The sole query is fixed, never caller-provided; old Sites may ignore it
+    # and return a fully validated v2 challenge. POST stays query-free.
+    path = ATTESTATION_PATH + ("?schemaVersion=3" if method == "GET" else "")
     request = Request(
-        f"{origin}{ATTESTATION_PATH}", data=body, method=method, headers=headers
+        f"{origin}{path}", data=body, method=method, headers=headers
     )
     client = opener or build_opener(NoRedirectHandler())
     try:
@@ -516,6 +545,12 @@ def submit_attestation(
         or response.get("verifierVersion") != bounded["verifierVersion"]
     ):
         raise AttestationError("Securus did not confirm the exact NBA attestation")
+    if bounded["schemaVersion"] == 3:
+        structurally_valid = bool(bounded["extractionSucceeded"] and bounded["schemaAnchorsVerified"] and bounded["targetDateSectionFound"] and bounded["reportedMatchups"] == bounded["expectedMatchups"] and bounded["textBytes"] >= 100 and all(t["blockVerified"] and t["submission"] != "UNKNOWN" for r in bounded["matchupEvidence"] for t in r["teams"]))
+        eligible = [r["matchup"] for r in bounded["matchupEvidence"] if structurally_valid and all(t["submission"] == "SUBMITTED" for t in r["teams"])]
+        blocked = [m for m in bounded["expectedMatchups"] if m not in eligible]
+        if response.get("eligibleMatchups") != eligible or response.get("blockedMatchups") != blocked:
+            raise AttestationError("Securus per-game eligibility disagrees with exact evidence")
     return response
 
 
@@ -771,6 +806,49 @@ def analyze_extracted_text(
     }
 
 
+def analyze_team_blocks_v3(text: str, target_game_date: str) -> list[dict[str, Any]]:
+    """Exact team boundaries; no cross-team propagation of submission status."""
+    lines = []
+    current_date = None
+    for line in unicodedata.normalize("NFKC", text).splitlines():
+        match = SECTION_DATE_RE.match(line)
+        if match:
+            try:
+                current_date = datetime.strptime(match.group(1), "%m/%d/%Y").date().isoformat()
+            except ValueError:
+                current_date = None
+        if current_date == target_game_date:
+            lines.append(line)
+    body = "\n".join(lines)
+    matches = list(MATCHUP_RE.finditer(body))
+    result = []
+    for index, match in enumerate(matches):
+        matchup = match.group(0)
+        away, home = matchup.split("@")
+        if away not in NBA_TEAMS or home not in NBA_TEAMS or away == home:
+            continue
+        block = body[match.end():matches[index + 1].start() if index + 1 < len(matches) else len(body)]
+        boundaries = [(m.start(), m.end(), code) for code, team_name in NBA_TEAMS.items() for m in re.finditer(re.escape(team_name), block)]
+        boundaries.sort()
+        teams = []
+        exact = [b[2] for b in boundaries] == [away, home]
+        for code in (away, home):
+            submission = "UNKNOWN"
+            if exact:
+                position = next(i for i, b in enumerate(boundaries) if b[2] == code)
+                team_text = block[boundaries[position][1]:boundaries[position + 1][0] if position + 1 < len(boundaries) else len(block)]
+                pending = len(NOT_SUBMITTED_RE.findall(team_text))
+                player_rows = re.findall(r"[A-Za-zÀ-ž'’. -]+,\s+[A-Za-zÀ-ž'’. -]+?\s+(?:Out|Available|Probable|Questionable|Doubtful)\b", team_text)
+                if pending == 1 and not player_rows:
+                    submission = "NOT_YET_SUBMITTED"
+                elif pending == 0 and player_rows and all(re.search(r"\b(?:Out|Available|Probable|Questionable|Doubtful)\b", line) for line in team_text.splitlines() if re.search(r"[A-Za-zÀ-ž],\s+[A-Za-zÀ-ž]", line)):
+                    submission = "SUBMITTED"
+            teams.append({"team": code, "submission": submission, "blockVerified": submission != "UNKNOWN"})
+        result.append({"matchup": matchup, "teams": teams})
+    # Duplicate matchups remain an invalid global schema, not a merged receipt.
+    return sorted(result, key=lambda row: row["matchup"])
+
+
 def verify_challenge(
     challenge: dict[str, Any],
     *,
@@ -796,7 +874,7 @@ def verify_challenge(
         )
 
     attestation = {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": bounded["schemaVersion"],
         "verifierVersion": bounded["verifierVersion"],
         "reportUrl": target["reportUrl"],
         "reportDate": target["reportDate"],
@@ -818,6 +896,16 @@ def verify_challenge(
         "notYetSubmittedCount": findings["notYetSubmittedCount"],
         "textBytes": text_bytes,
     }
+    if bounded["schemaVersion"] == 3:
+        evidence = analyze_team_blocks_v3(text, target["targetGameDate"])
+        attestation["matchupEvidence"] = evidence
+        attestation["teamBlocksComplete"] = bool(evidence) and all(t["submission"] == "SUBMITTED" and t["blockVerified"] for r in evidence for t in r["teams"])
+        # Unattributable NOT YET SUBMITTED text invalidates the global schema;
+        # never assign it to the nearest team or silently discard it.
+        attributed = sum(t["submission"] == "NOT_YET_SUBMITTED" for r in evidence for t in r["teams"])
+        if attributed != findings["notYetSubmittedCount"]:
+            attestation["schemaAnchorsVerified"] = False
+        attestation["notYetSubmittedCount"] = attributed
     return validate_attestation(attestation)
 
 
