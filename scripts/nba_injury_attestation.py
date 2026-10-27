@@ -42,7 +42,7 @@ ATTESTATION_PATH = "/api/nba-injury-attestation"
 PARSER_ID = "poppler-pdftotext-layout-v1"
 SCHEMA_VERSION = 2
 VERIFIER_VERSION = "securus-nba-completeness-v2"
-SUPPORTED_VERSIONS = {2: VERIFIER_VERSION, 3: "securus-nba-completeness-v3"}
+SUPPORTED_VERSIONS = {2: VERIFIER_VERSION, 3: "securus-nba-completeness-v3", 4: "securus-nba-completeness-v4"}
 PDF_HOST = "ak-static.cms.nba.com"
 MAX_JSON_BYTES = 64 * 1024
 MIN_PDF_BYTES = 8 * 1024
@@ -337,8 +337,10 @@ def validate_attestation(payload: dict[str, Any]) -> dict[str, Any]:
         "notYetSubmittedCount",
         "textBytes",
     }
-    if payload.get("schemaVersion") == 3:
+    if payload.get("schemaVersion") in (3, 4):
         expected_keys.add("matchupEvidence")
+    if payload.get("schemaVersion") == 4:
+        expected_keys.add("localizedMissingSectionsVerified")
     if set(payload) != expected_keys:
         raise AttestationError(
             f"attestation fields do not match schema version {SCHEMA_VERSION}"
@@ -428,7 +430,9 @@ def validate_attestation(payload: dict[str, Any]) -> dict[str, Any]:
         )
     ):
         raise AttestationError("failed extraction must not claim parsed evidence")
-    if payload["schemaVersion"] == 3:
+    if payload["schemaVersion"] in (3, 4):
+        if payload["schemaVersion"] == 4 and not isinstance(payload.get("localizedMissingSectionsVerified"), bool):
+            raise AttestationError("localizedMissingSectionsVerified must be boolean")
         rows = payload["matchupEvidence"]
         if not isinstance(rows, list) or len(rows) != len(reported_matchups):
             raise AttestationError("matchupEvidence must cover the full reported slate")
@@ -440,14 +444,21 @@ def validate_attestation(payload: dict[str, Any]) -> dict[str, Any]:
             if set(row) != {"matchup", "teams"} or not isinstance(row["teams"], list) or len(row["teams"]) != 2:
                 raise AttestationError("invalid matchupEvidence fields")
             for code, team in zip(row["matchup"].split("@"), row["teams"]):
-                if not isinstance(team, dict) or set(team) != {"team", "submission", "blockVerified"} or team["team"] != code or team["submission"] not in ("SUBMITTED", "NOT_YET_SUBMITTED", "UNKNOWN") or not isinstance(team["blockVerified"], bool):
+                if not isinstance(team, dict) or set(team) != {"team", "submission", "blockVerified"} or team["team"] != code or team["submission"] not in (("SUBMITTED", "NOT_YET_SUBMITTED", "UNKNOWN", "MISSING_SECTION") if payload["schemaVersion"] == 4 else ("SUBMITTED", "NOT_YET_SUBMITTED", "UNKNOWN")) or not isinstance(team["blockVerified"], bool):
                     raise AttestationError("invalid exact team evidence")
-                if (team["submission"] == "UNKNOWN") == team["blockVerified"]:
+                if (team["submission"] in ("UNKNOWN", "MISSING_SECTION")) == team["blockVerified"]:
                     raise AttestationError("unknown team blocks cannot be verified")
                 submitted = submitted and team["submission"] == "SUBMITTED" and team["blockVerified"]
                 not_submitted += team["submission"] == "NOT_YET_SUBMITTED"
         if payload["teamBlocksComplete"] != bool(rows and submitted) or not_submitted != payload["notYetSubmittedCount"]:
             raise AttestationError("global team findings contradict per-team evidence")
+        if payload["schemaVersion"] == 4:
+            localized = payload["localizedMissingSectionsVerified"]
+            structure = bool(payload["extractionSucceeded"] and payload["schemaAnchorsVerified"] and payload["targetDateSectionFound"] and payload["reportedMatchups"] == payload["expectedMatchups"] and payload["textBytes"] >= 100 and all(t["submission"] != "UNKNOWN" for r in rows for t in r["teams"]))
+            if localized and not structure:
+                raise AttestationError("localized missing proof contradicts global structure")
+            if not localized and any(t["submission"] == "MISSING_SECTION" for r in rows for t in r["teams"]):
+                raise AttestationError("missing sections require verified localization")
         if not payload["extractionSucceeded"] and rows:
             raise AttestationError("failed extraction cannot claim team evidence")
     return payload
@@ -490,7 +501,7 @@ def site_request_json(
     # Explicit capability negotiation keeps older scheduled verifiers on v2.
     # The sole query is fixed, never caller-provided; old Sites may ignore it
     # and return a fully validated v2 challenge. POST stays query-free.
-    path = ATTESTATION_PATH + ("?schemaVersion=3" if method == "GET" else "")
+    path = ATTESTATION_PATH + ("?schemaVersion=4" if method == "GET" else "")
     request = Request(
         f"{origin}{path}", data=body, method=method, headers=headers
     )
@@ -536,6 +547,7 @@ def submit_attestation(
         and bounded["targetMatchupCount"] == len(bounded["expectedMatchups"])
         and bounded["notYetSubmittedCount"] == 0
         and bounded["textBytes"] >= 100
+        and (bounded["schemaVersion"] != 4 or bounded["localizedMissingSectionsVerified"])
     )
     if (
         response.get("required") is not True
@@ -545,8 +557,8 @@ def submit_attestation(
         or response.get("verifierVersion") != bounded["verifierVersion"]
     ):
         raise AttestationError("Securus did not confirm the exact NBA attestation")
-    if bounded["schemaVersion"] == 3:
-        structurally_valid = bool(bounded["extractionSucceeded"] and bounded["schemaAnchorsVerified"] and bounded["targetDateSectionFound"] and bounded["reportedMatchups"] == bounded["expectedMatchups"] and bounded["textBytes"] >= 100 and all(t["blockVerified"] and t["submission"] != "UNKNOWN" for r in bounded["matchupEvidence"] for t in r["teams"]))
+    if bounded["schemaVersion"] in (3, 4):
+        structurally_valid = bool(bounded["extractionSucceeded"] and bounded["schemaAnchorsVerified"] and bounded["targetDateSectionFound"] and bounded["reportedMatchups"] == bounded["expectedMatchups"] and bounded["textBytes"] >= 100 and all((t["blockVerified"] and t["submission"] != "UNKNOWN") or (bounded["schemaVersion"] == 4 and t["submission"] == "MISSING_SECTION" and t["blockVerified"] is False) for r in bounded["matchupEvidence"] for t in r["teams"]) and (bounded["schemaVersion"] != 4 or bounded["localizedMissingSectionsVerified"]))
         eligible = [r["matchup"] for r in bounded["matchupEvidence"] if structurally_valid and all(t["submission"] == "SUBMITTED" for t in r["teams"])]
         blocked = [m for m in bounded["expectedMatchups"] if m not in eligible]
         if response.get("eligibleMatchups") != eligible or response.get("blockedMatchups") != blocked:
@@ -678,6 +690,7 @@ def extract_pdf_text(
     text_path: Path,
     workdir: Path,
     runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+    *, preserve_pages: bool = False,
 ) -> tuple[str, int]:
     clean_environment = {
         "HOME": str(workdir),
@@ -692,7 +705,7 @@ def extract_pdf_text(
                 "-layout",
                 "-enc",
                 "UTF-8",
-                "-nopgbrk",
+                *([] if preserve_pages else ["-nopgbrk"]),
                 str(pdf_path),
                 str(text_path),
             ],
@@ -849,6 +862,156 @@ def analyze_team_blocks_v3(text: str, target_game_date: str) -> list[dict[str, A
     return sorted(result, key=lambda row: row["matchup"])
 
 
+def analyze_team_blocks_v4(text: str, target_game_date: str, header_published_at: str, expected_matchups: list[str]) -> tuple[list[dict[str, Any]], bool]:
+    """Localize absence only after an ordered, fully attributed layout audit.
+
+    Team headings, player/status columns and reason continuations are classified
+    separately. Page transitions preserve the current team, never guess a new
+    one. Unclassified content invalidates the whole localization proof.
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    legacy_footers = list(PAGE_HEADER_RE.finditer(normalized))
+    if not legacy_footers or len(legacy_footers) > 100 or any(not 1 <= int(p.group(2)) <= 100 for p in legacy_footers):
+        return [], False
+    base = analyze_extracted_text(normalized, target_game_date, header_published_at)
+    pages = list(re.finditer(r"^[ \t]*Page[ \t]+(\d+)[ \t]+of[ \t]+(\d+)[ \t]*$", normalized, re.MULTILINE | re.IGNORECASE))
+    valid = bool(base["schemaAnchorsVerified"] and base["reportedMatchups"] == expected_matchups and pages)
+    if pages:
+        total = int(pages[0].group(2))
+        valid = valid and [(int(p.group(1)), int(p.group(2))) for p in pages] == [(n, total) for n in range(1, total + 1)]
+    chunks = []
+    offset = 0
+    for index, footer in enumerate(pages):
+        chunk = normalized[offset:footer.start()]
+        page_headers = list(REPORT_HEADER_RE.finditer(chunk))
+        valid = valid and len(page_headers) == 1
+        if len(page_headers) == 1:
+            header = page_headers[0]
+            # Header regex consumes leading whitespace, including form feeds;
+            # split at the literal title to audit the physical page boundary.
+            title_position = chunk.find("Injury Report:")
+            prefix = chunk[:title_position]
+            valid = valid and not prefix.strip(" \t\r\n\f") and prefix.count("\f") == (0 if index == 0 else 1)
+            valid = valid and "\f" not in chunk[title_position:]
+        valid = valid and chunk.count("\f") == (0 if index == 0 else 1)
+        chunks.append(chunk)
+        offset = footer.end()
+    valid = valid and not normalized[offset:].strip(" \t\r\n\f") and normalized[offset:].count("\f") == 1
+    player_re = re.compile(r"(?P<name>[A-Za-zÀ-ž][A-Za-zÀ-ž'’. -]*(?:, [A-Za-zÀ-ž'’. -]+)+?) {2,}(?P<status>Out|Available|Probable|Questionable|Doubtful)\b(?: {2,}(?P<reason>\S.*))? *$")
+    current_date = None
+    current_matchup = None
+    current_team = None
+    all_matchups: set[tuple[str, str]] = set()
+    groups: dict[str, dict[str, Any]] = {}
+    target_pending = 0
+    for chunk in chunks:
+        lines = chunk.splitlines()
+        # The rightmost reason column is evidenced by actual player rows on
+        # this page, not a guessed fixed offset across changing page layouts.
+        reason_columns = []
+        for line in lines:
+            m = player_re.search(line)
+            if m and m.group("reason"):
+                reason_columns.append(m.start("reason"))
+        reason_column = min(reason_columns) if reason_columns else None
+        for line in lines:
+            if not line.strip() or REPORT_HEADER_RE.fullmatch(line) or TABLE_HEADER_RE.search(re.sub(r"\s+", " ", line)):
+                continue
+            date_match = SECTION_DATE_RE.match(line)
+            if date_match:
+                try:
+                    current_date = datetime.strptime(date_match.group(1), "%m/%d/%Y").date().isoformat()
+                except ValueError:
+                    current_date = None
+                    valid = False
+            matchup_tokens = list(MATCHUP_RE.finditer(line))
+            cleaned = line
+            if matchup_tokens:
+                if len(matchup_tokens) != 1 or current_date is None:
+                    valid = False
+                    continue
+                token = matchup_tokens[0]
+                matchup = token.group(0)
+                away, home = matchup.split("@")
+                prefix = line[:token.start()].strip()
+                if prefix and not re.fullmatch(r"(?:(?:\d{2}/\d{2}/\d{4})\s+)?\d{1,2}:\d{2}\s+\(ET\)", prefix):
+                    valid = False
+                if away not in NBA_TEAMS or home not in NBA_TEAMS or away == home or (current_date, matchup) in all_matchups:
+                    valid = False
+                all_matchups.add((current_date, matchup))
+                current_matchup, current_team = matchup, None
+                if current_date == target_game_date:
+                    groups.setdefault(matchup, {"order": [], "teams": {}})
+                cleaned = " " * token.end() + line[token.end():]
+            headings = [(m, code) for code, label in NBA_TEAMS.items() for m in re.finditer(re.escape(label), cleaned)]
+            if headings:
+                if len(headings) != 1 or current_matchup is None:
+                    valid = False
+                    continue
+                h, code = headings[0]
+                if cleaned[:h.start()].strip() or code not in current_matchup.split("@"):
+                    valid = False
+                current_team = code
+                if current_date == target_game_date:
+                    g = groups[current_matchup]
+                    if code in g["teams"]:
+                        valid = False
+                    g["order"].append(code)
+                    g["teams"].setdefault(code, {"players": 0, "pending": 0})
+                cleaned = " " * h.end() + cleaned[h.end():]
+            if not cleaned.strip():
+                continue
+            player = player_re.search(cleaned)
+            if player:
+                if cleaned[:player.start()].strip() or "  " in player.group("name").strip() or current_team is None:
+                    valid = False
+                if current_date == target_game_date and current_matchup in groups and current_team in groups[current_matchup]["teams"]:
+                    groups[current_matchup]["teams"][current_team]["players"] += 1
+                continue
+            pending = NOT_SUBMITTED_RE.search(cleaned)
+            if pending:
+                if cleaned[:pending.start()].strip() or cleaned[pending.end():].strip() or current_team is None:
+                    valid = False
+                if current_date == target_game_date:
+                    target_pending += 1
+                    if current_matchup in groups and current_team in groups[current_matchup]["teams"]:
+                        groups[current_matchup]["teams"][current_team]["pending"] += 1
+                continue
+            # Reasons may wrap above the first player line on a page. A known
+            # reason column permits that layout, but never an orphan player row.
+            column = len(cleaned) - len(cleaned.lstrip())
+            if reason_column is None or column < reason_column or re.search(r"\b(?:Out|Available|Probable|Questionable|Doubtful)\b", cleaned) or re.search(r"[A-Za-zÀ-ž],\s+[A-Za-zÀ-ž]", cleaned):
+                valid = False
+            elif current_team is None and not re.match(r"(?:Injury/Illness -|G League -|Not With Team|Rest|Personal Reasons)", cleaned.strip()):
+                valid = False
+    result = []
+    for matchup in sorted(groups):
+        away, home = matchup.split("@")
+        group = groups[matchup]
+        if group["order"] != [code for code in (away, home) if code in group["teams"]]:
+            valid = False
+        teams = []
+        for code in (away, home):
+            record = group["teams"].get(code)
+            submission = "MISSING_SECTION" if record is None else "UNKNOWN"
+            if record is not None:
+                if record["players"] > 0 and record["pending"] == 0:
+                    submission = "SUBMITTED"
+                elif record["players"] == 0 and record["pending"] == 1:
+                    submission = "NOT_YET_SUBMITTED"
+                else:
+                    valid = False
+            teams.append({"team": code, "submission": submission, "blockVerified": submission in ("SUBMITTED", "NOT_YET_SUBMITTED")})
+        result.append({"matchup": matchup, "teams": teams})
+    valid = bool(valid and sorted(groups) == expected_matchups and target_pending == base["notYetSubmittedCount"])
+    if not valid:
+        for row in result:
+            for team in row["teams"]:
+                if team["submission"] == "MISSING_SECTION":
+                    team["submission"] = "UNKNOWN"
+    return result, valid
+
+
 def verify_challenge(
     challenge: dict[str, Any],
     *,
@@ -866,7 +1029,11 @@ def verify_challenge(
         pdf_path = workdir / "report.pdf"
         text_path = workdir / "report.txt"
         download_exact_pdf(target, pdf_path, opener=pdf_opener)
-        text, text_bytes = extract_pdf_text(pdf_path, text_path, workdir, runner)
+        text, text_bytes = extract_pdf_text(pdf_path, text_path, workdir, runner, preserve_pages=bounded["schemaVersion"] == 4)
+        if bounded["schemaVersion"] == 4:
+            footers = list(PAGE_HEADER_RE.finditer(text))
+            if not footers or len(footers) > 100 or any(not 1 <= int(p.group(2)) <= 100 for p in footers):
+                raise AttestationError("v4 report page sequence is missing or oversized")
         findings = analyze_extracted_text(
             text,
             target["targetGameDate"],
@@ -896,8 +1063,12 @@ def verify_challenge(
         "notYetSubmittedCount": findings["notYetSubmittedCount"],
         "textBytes": text_bytes,
     }
-    if bounded["schemaVersion"] == 3:
-        evidence = analyze_team_blocks_v3(text, target["targetGameDate"])
+    if bounded["schemaVersion"] in (3, 4):
+        if bounded["schemaVersion"] == 4:
+            evidence, localized = analyze_team_blocks_v4(text, target["targetGameDate"], target.get("filenamePublishedAt", target["reportPublishedAt"]), target["expectedMatchups"])
+            attestation["localizedMissingSectionsVerified"] = localized
+        else:
+            evidence = analyze_team_blocks_v3(text, target["targetGameDate"])
         attestation["matchupEvidence"] = evidence
         attestation["teamBlocksComplete"] = bool(evidence) and all(t["submission"] == "SUBMITTED" and t["blockVerified"] for r in evidence for t in r["teams"])
         # Unattributable NOT YET SUBMITTED text invalidates the global schema;

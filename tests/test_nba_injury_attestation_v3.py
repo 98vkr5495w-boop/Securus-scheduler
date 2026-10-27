@@ -64,7 +64,7 @@ class NegotiationTests(unittest.TestCase):
     def test_explicit_fixed_get_query_accepts_old_v2_and_new_v3_challenges(self):
         import json
         from scripts.nba_injury_attestation import fetch_challenge, site_request_json
-        for version in (2, 3):
+        for version in (2, 3, 4):
             payload=challenge()
             payload.update(schemaVersion=version,verifierVersion=f'securus-nba-completeness-v{version}')
             opener=FakeOpener(FakeResponse(json.dumps(payload).encode(),status=200,content_type='application/json'))
@@ -72,7 +72,7 @@ class NegotiationTests(unittest.TestCase):
             self.assertEqual(result['schemaVersion'],version)
             self.assertEqual(len(opener.requests),1)
             request,_=opener.requests[0]
-            self.assertEqual(request.full_url,'https://securus.example/api/nba-injury-attestation?schemaVersion=3')
+            self.assertEqual(request.full_url,'https://securus.example/api/nba-injury-attestation?schemaVersion=4')
             self.assertEqual(request.get_method(),'GET')
             self.assertEqual(request.get_header('Authorization'),'Bearer oidc')
 
