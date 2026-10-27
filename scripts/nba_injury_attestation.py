@@ -914,7 +914,37 @@ def analyze_team_blocks_v4(text: str, target_game_date: str, header_published_at
             if m and m.group("reason"):
                 reason_columns.append(m.start("reason"))
         reason_column = min(reason_columns) if reason_columns else None
-        for line in lines:
+        wrapped_reason_lines: set[int] = set()
+        wrapped_reason_column = None
+        if reason_column is None:
+            # A page can contain only vertically wrapped reasons. In that
+            # case repeated team-labelled pending cells independently evidence
+            # the right-hand column; arbitrary prose cannot establish it.
+            pending_columns: dict[int, set[str]] = {}
+            for line in lines:
+                pending = NOT_SUBMITTED_RE.search(line)
+                labels = [code for code, label in NBA_TEAMS.items() if label in line]
+                if pending and len(labels) == 1 and not line[pending.end():].strip():
+                    pending_columns.setdefault(pending.start(), set()).add(labels[0])
+            if len(pending_columns) == 1:
+                candidate_column, labels = next(iter(pending_columns.items()))
+                if len(labels) >= 2:
+                    wrapped_reason_column = candidate_column
+            nonblank = [i for i, line in enumerate(lines) if line.strip()]
+            for position in range(1, len(nonblank) - 1):
+                before, middle, after = nonblank[position - 1:position + 2]
+                player = player_re.search(lines[middle])
+                if not player or player.group("reason"):
+                    continue
+                column = len(lines[before]) - len(lines[before].lstrip())
+                if (len(pending_columns) == 1
+                        and len(pending_columns.get(column, set())) >= 2
+                        and column > player.end("status")
+                        and len(lines[after]) - len(lines[after].lstrip()) == column
+                        and re.match(r"(?:Injury/Illness -|G League -|Not With Team|Rest|Personal Reasons)(?: |$)", lines[before].strip())
+                        and not re.match(r"(?:Injury/Illness -|G League -|Not With Team|Rest|Personal Reasons)(?: |$)", lines[after].strip())):
+                    wrapped_reason_lines.update((before, after))
+        for line_index, line in enumerate(lines):
             if not line.strip() or REPORT_HEADER_RE.fullmatch(line) or TABLE_HEADER_RE.search(re.sub(r"\s+", " ", line)):
                 continue
             date_match = SECTION_DATE_RE.match(line)
@@ -965,6 +995,8 @@ def analyze_team_blocks_v4(text: str, target_game_date: str, header_published_at
             if player:
                 if cleaned[:player.start()].strip() or "  " in player.group("name").strip() or current_team is None:
                     valid = False
+                if wrapped_reason_column is not None and player.end("status") >= wrapped_reason_column:
+                    valid = False
                 if current_date == target_game_date and current_matchup in groups and current_team in groups[current_matchup]["teams"]:
                     groups[current_matchup]["teams"][current_team]["players"] += 1
                 continue
@@ -980,7 +1012,7 @@ def analyze_team_blocks_v4(text: str, target_game_date: str, header_published_at
             # Reasons may wrap above the first player line on a page. A known
             # reason column permits that layout, but never an orphan player row.
             column = len(cleaned) - len(cleaned.lstrip())
-            if reason_column is None or column < reason_column or re.search(r"\b(?:Out|Available|Probable|Questionable|Doubtful)\b", cleaned) or re.search(r"[A-Za-zÀ-ž],\s+[A-Za-zÀ-ž]", cleaned):
+            if (reason_column is None and line_index not in wrapped_reason_lines) or (reason_column is not None and column < reason_column) or re.search(r"\b(?:Out|Available|Probable|Questionable|Doubtful)\b", cleaned) or re.search(r"[A-Za-zÀ-ž],\s+[A-Za-zÀ-ž]", cleaned):
                 valid = False
             elif current_team is None and not re.match(r"(?:Injury/Illness -|G League -|Not With Team|Rest|Personal Reasons)", cleaned.strip()):
                 valid = False
