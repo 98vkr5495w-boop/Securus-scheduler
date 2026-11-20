@@ -191,6 +191,8 @@ jobs:
       SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
     outputs:
       run_frequent: ${{ steps.cadence.outputs.run_frequent }}
+      propline_started_at: ${{ steps.propline.outputs.startedAt }}
+      propline_completed_at: ${{ steps.propline.outputs.completedAt }}
       nba_attestation_required: ${{ steps.nba_challenge.outputs.required }}
       nba_attestation_challenge: ${{ steps.nba_challenge.outputs.challenge }}
 
@@ -369,9 +371,11 @@ jobs:
         run: python scripts/collect_kalshi_props.py
 
       - name: Refresh independent player prop sportsbook prices
+        id: propline
         if: steps.oidc_props.outcome == 'success'
         continue-on-error: true
         env:
+          SECURUS_RECEIPT_OUTPUT: propline
           SECURUS_OIDC_TOKEN: ${{ steps.oidc_props.outputs.token }}
         run: bash scripts/collect_source.sh "mode=fast&source=propline"
 
@@ -530,6 +534,17 @@ jobs:
           --source nba-stats
           --source nflverse
           --source baseball-savant
+
+      - name: Verify this cycle's durable PropLine receipt
+        env:
+          PROPLINE_STARTED_AT: ${{ needs.collect-inputs.outputs.propline_started_at }}
+          PROPLINE_COMPLETED_AT: ${{ needs.collect-inputs.outputs.propline_completed_at }}
+          CYCLE_KEY: ${{ needs.cadence-gate.outputs.cycle_key }}
+        run: >-
+          python scripts/verify_freshness.py "$SECURUS_URL" --current-propline-receipt
+          --propline-started-at "$PROPLINE_STARTED_AT"
+          --propline-completed-at "$PROPLINE_COMPLETED_AT"
+          --cycle-key "$CYCLE_KEY"
 
       - name: Run one verified Crypto paper scan
         env:

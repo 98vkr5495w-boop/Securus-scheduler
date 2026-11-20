@@ -176,13 +176,14 @@ def validate_completed_scan(payload: dict[str, Any]) -> list[dict[str, Any]]:
         "mode": "PAPER_ONLY",
         "analyst": "SECURUS",
         "paperBettor": "CRYPTO",
-        "venue": "KALSHI",
+        "venue": "FANATICS",
+        "legacySettlementPreserved": True,
         "realMoneyExecution": False,
     }
     mismatches = [
         f"result.{field}={payload.get(field)!r}"
         for field, value in expected.items()
-        if payload.get(field) != value
+        if payload.get(field) != value or (type(value) is bool and type(payload.get(field)) is not bool)
     ]
     if payload.get("status") in NONTERMINAL_STATUSES | {"ALREADY_RUNNING"}:
         mismatches.append(f"result.status={payload.get('status')!r}")
