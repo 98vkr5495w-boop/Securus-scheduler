@@ -26,6 +26,7 @@ SCHEDULE_EARLY_GRACE_MINUTES = 2
 # progress" would defer recovery forever (observed 2026-09-13, ~15 hours).
 ABANDONED_COLLECTION_MINUTES = 20
 PUBLIC_SOURCE_URL = "https://edgelab-sports.jkv9c8bzjn.chatgpt.site/api/data-sources"
+PUBLIC_INCIDENT_URL = "https://edgelab-sports.jkv9c8bzjn.chatgpt.site/api/ops/incidents"
 FREQUENT_SOURCES = frozenset({"mlb-stats-api", "action-network", "sleeper-nfl", "kalshi", "open-meteo"})
 DEEP_SOURCES = frozenset({"nflverse", "baseball-savant"})
 GATED_SOURCES = FREQUENT_SOURCES | DEEP_SOURCES
@@ -494,6 +495,64 @@ def scheduler_is_due(
     )
 
 
+def recent_storage_write_rejection(payload, attempted, now):
+    """Require recorded storage 507 evidence from the last bounded attempt."""
+    rows = payload.get("incidents")
+    if not isinstance(rows, list) or len(rows) > 50:
+        return False
+    for row in rows:
+        if not isinstance(row, dict) or row.get("route") not in ("/api/collect", "/api/data-ingest"):
+            continue
+        if row.get("status") != 507 or row.get("code") != "INSUFFICIENT_STORAGE":
+            continue
+        stamp = row.get("time")
+        when = parse_timestamp(stamp)
+        # D1's CURRENT_TIMESTAMP uses a UTC SQL timestamp without a suffix.
+        if when is None and isinstance(stamp, str) and len(stamp) == 19 and stamp[10] == " ":
+            when = parse_timestamp(stamp + "Z")
+        if when is not None and attempted <= when <= now and now - when <= timedelta(minutes=30):
+            return True
+    return False
+
+
+def read_public_storage_incidents():
+    request = Request(PUBLIC_INCIDENT_URL, headers={"Accept": "application/json",
+                                                   "Cache-Control": "no-cache"})
+    with urlopen(request, timeout=10) as response:
+        if response.geturl() != PUBLIC_INCIDENT_URL:
+            raise ValueError("unexpected incident status URL")
+        if "application/json" not in response.headers.get("Content-Type", "").lower():
+            raise ValueError("incident status is not JSON")
+        raw = response.read(16385)
+    if len(raw) > 16384:
+        raise ValueError("incident status exceeds size limit")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("incident status is not an object")
+    return value
+
+
+def storage_lockout_recovery_allowed(payload, incidents, attempted, now):
+    """Prefer one existing storage-only job; never relax write/scan gates."""
+    capacity = (payload.get("storage") or {}).get("capacity") or {}
+    utilization = capacity.get("utilizationPercent")
+    if (attempted is None or now - attempted < timedelta(minutes=RETRY_COOLDOWN_MINUTES)
+        or storage_blocker(payload) is not None or capacity.get("capacityState") != "WARNING"
+        or type(utilization) not in (float, int) or not 83.5 <= utilization < 85
+        or not source_refresh_due(payload, now) or collection_in_progress(payload, now)
+        or storage_maintenance_in_cooldown(payload, now)):
+        return False
+    for row in payload.get("sources", []) or []:
+        if not isinstance(row, dict) or row.get("id") != "propline":
+            continue
+        run = row.get("lastRun") or {}
+        if isinstance(run, dict) and run.get("status") in ("RUNNING", "QUEUED", "IN_PROGRESS"):
+            started = parse_timestamp(run.get("startedAt"))
+            if started is None or now - started < timedelta(minutes=ABANDONED_COLLECTION_MINUTES):
+                return False
+    return recent_storage_write_rejection(incidents, attempted, now)
+
+
 def recover_cycle(
     api_get: ApiGet,
     api_request: Callable[..., dict[str, Any]],
@@ -504,11 +563,32 @@ def recover_cycle(
     *,
     now: datetime | None = None,
     source_get: Callable[[], dict[str, Any]] | None = None,
+    incidents_get: Callable[[], dict[str, Any]] | None = None,
 ) -> tuple[bool, str]:
     due, reason = scheduler_is_due(
         api_get, repository, workflow, branch, boundary, now=now, source_get=source_get
     )
     maintenance_only = False
+    # Reuse the trusted, serialized GitHub storage-only workflow. The external
+    # maintenance identity and Site archive/deletion fences are untouched.
+    if due and source_get is not None and incidents_get is not None:
+        try:
+            payload = source_get()
+            checked_at = now or boundary
+            capacity = (payload.get("storage") or {}).get("capacity") or {}
+            usage = capacity.get("utilizationPercent")
+            if capacity.get("capacityState") == "WARNING" and type(usage) in (int, float) and 83.5 <= usage < 85:
+                attempted, _ = collection_timestamps(api_get, repository, workflow, branch)
+                if storage_lockout_recovery_allowed(payload, incidents_get(), attempted, checked_at):
+                    maintenance_only = True
+                    reason = ("recent collector storage rejection near the write gate; "
+                              "dispatching archive-verified maintenance only; source recovery unverified")
+        except CollectionPending:
+            return False, "runtime already queued or in progress; storage-only dispatch deferred"
+        except Exception:
+            # The new recovery override requires positive evidence. Preserve
+            # the original due decision when the optional evidence is absent.
+            pass
     # Also drain WARNING storage while feeds are fresh: a green feed check must
     # not starve preventive cleanup. Overdue feeds retain priority below the
     # critical boundary. Neither path changes collection cadence or admission.
@@ -630,6 +710,7 @@ def main() -> int:
             boundary,
             now=now,
             source_get=source_get,
+            incidents_get=read_public_storage_incidents,
         )
     else:
         due, reason = scheduler_is_due(
