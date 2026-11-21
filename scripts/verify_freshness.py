@@ -85,6 +85,24 @@ def freshness_failures(
     return failures
 
 
+def propline_storage_admission_failures(payload, now):
+    capacity = (payload.get("storage") or {}).get("capacity") or {}
+    used, limit = capacity.get("actualBytes"), capacity.get("safetyCapacityBytes")
+    measured = parse_timestamp(capacity.get("maintenanceMeasuredAt"))
+    if not measured or not 0 <= (now - measured).total_seconds() <= 300:
+        return ["No recent measured maintenance capacity for PropLine"]
+    utilization = capacity.get("utilizationPercent")
+    if (capacity.get("sizeSource") != "D1_META"
+        or capacity.get("capacityState") not in ("NORMAL", "WARNING")
+        or capacity.get("maintenanceState") not in ("NORMAL", "WARNING")
+        or type(used) is not int or type(limit) is not int or not 0 < used <= limit
+        or type(utilization) not in (float, int) or not math.isfinite(utilization)
+        or abs(utilization - 100 * used / limit) > .02
+        or utilization > 84 or 100 * used > 84 * limit):
+        return ["Verified storage has insufficient admission headroom for PropLine"]
+    return []
+
+
 def propline_receipt_failures(payload, *, expected_start, expected_end, cycle_key, now):
     """Bind the latest durable result to this workflow's exact PropLine POST."""
     start, end = parse_timestamp(expected_start), parse_timestamp(expected_end)
@@ -146,22 +164,45 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
     parser.add_argument("--source", action="append", dest="sources", default=[])
-    parser.add_argument("--current-propline-receipt", action="store_true")
+    gate_mode = parser.add_mutually_exclusive_group()
+    gate_mode.add_argument("--current-propline-receipt", action="store_true")
+    gate_mode.add_argument("--propline-storage-admission", action="store_true")
     parser.add_argument("--propline-started-at", default="")
     parser.add_argument("--propline-completed-at", default="")
     parser.add_argument("--cycle-key", default="")
     args = parser.parse_args()
 
-    if args.current_propline_receipt:
+    if args.propline_storage_admission:
         try:
-            status = read_status(args.url)
-            failures = propline_receipt_failures(
-                status, expected_start=args.propline_started_at,
-                expected_end=args.propline_completed_at, cycle_key=args.cycle_key,
-                now=datetime.now(timezone.utc),
-            )
+            failures = propline_storage_admission_failures(read_status(args.url), datetime.now(timezone.utc))
         except Exception:
-            failures = ["PropLine current-cycle status unavailable"]
+            failures = ["PropLine storage measurement unavailable"]
+        if failures:
+            print("Storage admission failed: " + ", ".join(failures) + ".", file=sys.stderr)
+            return 1
+        print("Recent measured capacity is within PropLine admission bounds.")
+        return 0
+
+    if args.current_propline_receipt:
+        # Status snapshots can briefly lag a committed write; read-only
+        # rechecks never retry the POST or extend the five-minute age gate.
+        for attempt in range(4):
+            try:
+                failures = propline_receipt_failures(
+                    read_status(args.url), expected_start=args.propline_started_at,
+                    expected_end=args.propline_completed_at, cycle_key=args.cycle_key,
+                    now=datetime.now(timezone.utc),
+                )
+            except Exception:
+                failures = ["PropLine current-cycle status unavailable"]
+            recheckable = all(failure in {
+                "PropLine durable collection receipt missing or ambiguous",
+                "PropLine durable receipt does not match this successful collection",
+                "PropLine current-cycle status unavailable",
+            } for failure in failures)
+            if not failures or not recheckable or attempt == 3:
+                break
+            time.sleep(15)
         if failures:
             print("Freshness gate failed: " + ", ".join(failures) + ".", file=sys.stderr)
             return 1

@@ -8,8 +8,13 @@ query=${1:?"usage: collect_source.sh 'mode=fast&source=source-id'"}
 source_id=${query#*source=}
 source_id=${source_id%%&*}
 
+retry_args=(--retry 2 --retry-all-errors)
+# A transport failure may hide a partial commit. Do not replay this POST.
+if [[ "$source_id" == "propline" ]]; then
+  retry_args=(--retry 0 --max-time 130)
+fi
 response=$(curl --fail-with-body --silent --show-error \
-  --retry 2 --retry-all-errors \
+  "${retry_args[@]}" \
   -X POST \
   -H "Authorization: Bearer ${SECURUS_OIDC_TOKEN}" \
   -H "Accept: application/json" \
