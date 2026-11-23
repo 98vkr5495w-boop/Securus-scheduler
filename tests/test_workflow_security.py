@@ -104,7 +104,9 @@ class WorkflowSecurityTests(unittest.TestCase):
             self.collect.count("if: steps.cadence.outputs.run_frequent == 'true'"),
             6,
         )
-        self.assertIn("if: steps.cadence.outputs.run_deep == 'true'", self.collect)
+        self.assertIn("run_deep: ${{ steps.cadence.outputs.run_deep }}", self.collect)
+        self.assertNotIn("mode=daily&source=", self.collect)
+        self.assertIn("if: needs.collect-inputs.outputs.run_deep == 'true' && steps.paper_scan.outcome == 'success'", self.final)
 
     def test_scheduler_serializes_runtime_while_watchdog_stays_non_cancelling(self):
         watchdog = (WORKFLOW.parent / "securus-watchdog.yml").read_text(encoding="utf-8")
