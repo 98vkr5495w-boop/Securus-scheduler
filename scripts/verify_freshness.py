@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import sys
@@ -17,6 +17,7 @@ MAX_AGE_MINUTES = {
     "mlb-stats-api": 45,
     "action-network": 45,
     "kalshi": 45,
+    "propline": 5,
     "open-meteo": 90,
     "sleeper-nfl": 150,
     "nba-stats": 180,
@@ -84,6 +85,48 @@ def freshness_failures(
     return failures
 
 
+def propline_storage_admission_failures(payload, now):
+    capacity = (payload.get("storage") or {}).get("capacity") or {}
+    used, limit = capacity.get("actualBytes"), capacity.get("safetyCapacityBytes")
+    measured = parse_timestamp(capacity.get("maintenanceMeasuredAt"))
+    if not measured or not 0 <= (now - measured).total_seconds() <= 300:
+        return ["No recent measured maintenance capacity for PropLine"]
+    utilization = capacity.get("utilizationPercent")
+    if (capacity.get("sizeSource") != "D1_META"
+        or capacity.get("capacityState") not in ("NORMAL", "WARNING")
+        or capacity.get("maintenanceState") not in ("NORMAL", "WARNING")
+        or type(used) is not int or type(limit) is not int or not 0 < used <= limit
+        or type(utilization) not in (float, int) or not math.isfinite(utilization)
+        or abs(utilization - 100 * used / limit) > .02
+        or utilization > 84 or 100 * used > 84 * limit):
+        return ["Verified storage has insufficient admission headroom for PropLine"]
+    return []
+
+
+def propline_receipt_failures(payload, *, expected_start, expected_end, cycle_key, now):
+    """Bind the latest durable result to this workflow's exact PropLine POST."""
+    start, end = parse_timestamp(expected_start), parse_timestamp(expected_end)
+    cycle = parse_timestamp(cycle_key)
+    if not start or not end or (cycle_key and (
+        not cycle or cycle.minute not in (7, 37) or cycle.second or cycle.microsecond
+        or not cycle <= start < cycle + timedelta(minutes=30)
+    )):
+        return ["PropLine current-cycle collection receipt missing or out of slot"]
+    if not start <= end <= now or (now - end).total_seconds() > 300:
+        return ["PropLine current-cycle collection receipt outside five-minute window"]
+    runs = [row.get("lastRun") for row in (payload.get("sources") or [])
+            if isinstance(row, dict) and row.get("id") == "propline"]
+    if len(runs) != 1 or not isinstance(runs[0], dict):
+        return ["PropLine durable collection receipt missing or ambiguous"]
+    run = runs[0]
+    if (run.get("status") != "SUCCEEDED"
+        or type(run.get("recordsWritten")) is not int or run["recordsWritten"] < 1
+        or parse_timestamp(run.get("startedAt")) != start
+        or parse_timestamp(run.get("completedAt")) != end):
+        return ["PropLine durable receipt does not match this successful collection"]
+    return freshness_failures(payload, {"propline"}, now)
+
+
 def verify_with_rechecks(load, wanted, *, clock=lambda: datetime.now(timezone.utc), sleep=time.sleep):
     """Cross the public status cache TTL without refreshing sources or relaxing limits."""
     failures = []
@@ -121,10 +164,53 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
     parser.add_argument("--source", action="append", dest="sources", default=[])
+    gate_mode = parser.add_mutually_exclusive_group()
+    gate_mode.add_argument("--current-propline-receipt", action="store_true")
+    gate_mode.add_argument("--propline-storage-admission", action="store_true")
+    parser.add_argument("--propline-started-at", default="")
+    parser.add_argument("--propline-completed-at", default="")
+    parser.add_argument("--cycle-key", default="")
     args = parser.parse_args()
 
+    if args.propline_storage_admission:
+        try:
+            failures = propline_storage_admission_failures(read_status(args.url), datetime.now(timezone.utc))
+        except Exception:
+            failures = ["PropLine storage measurement unavailable"]
+        if failures:
+            print("Storage admission failed: " + ", ".join(failures) + ".", file=sys.stderr)
+            return 1
+        print("Recent measured capacity is within PropLine admission bounds.")
+        return 0
+
+    if args.current_propline_receipt:
+        # Status snapshots can briefly lag a committed write; read-only
+        # rechecks never retry the POST or extend the five-minute age gate.
+        for attempt in range(4):
+            try:
+                failures = propline_receipt_failures(
+                    read_status(args.url), expected_start=args.propline_started_at,
+                    expected_end=args.propline_completed_at, cycle_key=args.cycle_key,
+                    now=datetime.now(timezone.utc),
+                )
+            except Exception:
+                failures = ["PropLine current-cycle status unavailable"]
+            recheckable = all(failure in {
+                "PropLine durable collection receipt missing or ambiguous",
+                "PropLine durable receipt does not match this successful collection",
+                "PropLine current-cycle status unavailable",
+            } for failure in failures)
+            if not failures or not recheckable or attempt == 3:
+                break
+            time.sleep(15)
+        if failures:
+            print("Freshness gate failed: " + ", ".join(failures) + ".", file=sys.stderr)
+            return 1
+        print("Committed PropLine receipt matched this collection within five minutes.")
+        return 0
+
     now = datetime.now(timezone.utc)
-    wanted = set(args.sources or MAX_AGE_MINUTES)
+    wanted = set(args.sources or (MAX_AGE_MINUTES.keys() - {"propline"}))
     if nba_reporting_inactive(now):
         wanted.difference_update({"nba-stats", "nba-official-injuries"})
     failures = verify_with_rechecks(lambda: read_status(args.url), wanted)
