@@ -169,9 +169,10 @@ def maintain(api=request, *, target=83.5, max_passes=MAX_PASSES,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-percent", type=float, default=83.5)
+    parser.add_argument("--max-passes", type=int, default=MAX_PASSES)
     args = parser.parse_args()
     try:
-        maintain(target=args.target_percent)
+        maintain(target=args.target_percent, max_passes=args.max_passes)
     except HTTPError as error:
         print(f"::error::Verified storage maintenance HTTP {error.code}; collection blocked")
         return 1

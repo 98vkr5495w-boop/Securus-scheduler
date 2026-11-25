@@ -12,6 +12,8 @@ retry_args=(--retry 2 --retry-all-errors)
 # A transport failure may hide a partial commit. Do not replay this POST.
 if [[ "$source_id" == "propline" ]]; then
   retry_args=(--retry 0 --max-time 130)
+elif [[ "$source_id" == "nflverse" || "$source_id" == "baseball-savant" ]]; then
+  retry_args=(--retry 0 --max-time 120)
 fi
 response=$(curl --fail-with-body --silent --show-error \
   "${retry_args[@]}" \
@@ -23,6 +25,10 @@ response=$(curl --fail-with-body --silent --show-error \
 jq -e \
   '.accepted == true and (.results | length == 1) and .results[0].status == "SUCCEEDED"' \
   <<<"${response}" >/dev/null
+
+if [[ "$source_id" == "nflverse" || "$source_id" == "baseball-savant" ]]; then
+  jq -e --arg source "$source_id" '.results[0].sourceId == $source' <<<"${response}" >/dev/null
+fi
 
 records=$(jq -r '.recordsWritten // 0' <<<"${response}")
 

@@ -36,6 +36,7 @@ on:
       - scripts/verify_freshness.py
       - scripts/check_scheduler_due.py
       - scripts/maintain_storage.py
+      - scripts/collect_deep_after_cleanup.py
       - scripts/nba_injury_attestation.py
       - tests/**
       - external/**
@@ -74,6 +75,7 @@ jobs:
             scripts/verify_freshness.py \
             scripts/check_scheduler_due.py \
             scripts/maintain_storage.py \
+            scripts/collect_deep_after_cleanup.py \
             scripts/nba_injury_attestation.py
           python -m unittest discover -s tests -v
           node --test tests/test_external_recovery.mjs
@@ -191,6 +193,7 @@ jobs:
       SECURUS_URL: https://edgelab-sports.jkv9c8bzjn.chatgpt.site
     outputs:
       run_frequent: ${{ steps.cadence.outputs.run_frequent }}
+      run_deep: ${{ steps.cadence.outputs.run_deep }}
       nba_attestation_required: ${{ steps.nba_challenge.outputs.required }}
       nba_attestation_challenge: ${{ steps.nba_challenge.outputs.challenge }}
 
@@ -368,39 +371,6 @@ jobs:
           SECURUS_OIDC_TOKEN: ${{ steps.oidc_props.outputs.token }}
         run: python scripts/collect_kalshi_props.py
 
-      - name: Refresh identity for deep sources
-        if: steps.cadence.outputs.run_deep == 'true'
-        id: oidc_deep
-        shell: bash
-        run: |
-          set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
-          token=$(jq -er '.value' <<<"$response")
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-
-      - name: Refresh bounded deep statistics
-        if: steps.cadence.outputs.run_deep == 'true'
-        id: deep
-        continue-on-error: true
-        env:
-          SECURUS_OIDC_TOKEN: ${{ steps.oidc_deep.outputs.token }}
-        shell: bash
-        run: |
-          set -u
-          failures=()
-          for source in nflverse baseball-savant; do
-            if ! bash scripts/collect_source.sh "mode=daily&source=$source"; then
-              failures+=("$source")
-            fi
-          done
-          if ((${#failures[@]})); then
-            echo "Deep collectors needing attention: ${failures[*]}" >&2
-            exit 1
-          fi
-
       - name: Recheck bounded storage after collection
         id: post_maintenance
         continue-on-error: true
@@ -558,6 +528,7 @@ jobs:
           --cycle-key "$CYCLE_KEY"
 
       - name: Run one verified Crypto paper scan
+        id: paper_scan
         env:
           REQUEST_KEY: ${{ github.repository_id }}
           RECOVERY: ${{ inputs.recovery }}
@@ -571,6 +542,36 @@ jobs:
           else
             python scripts/run_crypto_paper.py "$SECURUS_URL"
           fi
+
+          echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Mint post-scan identity for due deep sources
+        if: needs.collect-inputs.outputs.run_deep == 'true' && steps.paper_scan.outcome == 'success'
+        id: oidc_deep
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=securus-collector")
+          token=$(jq -er '.value' <<<"$response")
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh due deep statistics with measured headroom
+        # Never consume the PropLine/scan reservation or retroactively clear
+        # the pre-scan freshness result. New receipts benefit later cycles.
+        if: steps.oidc_deep.outcome == 'success'
+        id: deep
+        continue-on-error: true
+        timeout-minutes: 9
+        env:
+          SECURUS_OIDC_TOKEN: ${{ steps.oidc_deep.outputs.token }}
+          CYCLE_KEY: ${{ needs.cadence-gate.outputs.cycle_key }}
+          PAPER_SCAN_VERIFIED_AT: ${{ steps.paper_scan.outputs.verified_at }}
+          MANUAL_DEEP: ${{ github.event_name == 'workflow_dispatch' && inputs.recovery != true }}
+        run: python scripts/collect_deep_after_cleanup.py
 
       - name: Surface stale decision inputs after the scan
         if: always() && steps.freshness.outcome != 'success'

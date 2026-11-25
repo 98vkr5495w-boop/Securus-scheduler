@@ -17,8 +17,15 @@ reset that clock. Failed or unavailable source checks have a ten-minute retry
 cooldown measured from actual `collect-inputs` attempts, preventing rapid retries.
 The watchdog has Actions write permission but no OIDC permission. It sends no
 GitHub credential to Securus and never logs source response bodies.
-Deep-stat freshness is checked separately against the existing six-hour cadence,
-so a skipped :07 slot cannot starve nflverse or Baseball Savant updates.
+Deep-stat freshness is checked separately against the existing six-hour cadence.
+Due nflverse and Baseball Savant writes run after the existing same-cycle
+PropLine and verified paper scan path, not before storage cleanup. Each one
+requires a new post-scan (or post-write) D1 capacity sample at or below 84%
+inside the current slot; at most one existing verified maintenance sequence
+of three passes may be used for additional headroom. A deep collection POST
+is never retried after an ambiguous result, and success does not retroactively
+change the pre-scan freshness judgement. This prioritizes the just-recovered
+odds write without treating a skipped daily refresh as healthy.
 It also checks after trusted main-branch scheduler completions, including
 validation deployments. Pull-request and foreign-repository completions cannot
 enter this privileged recovery path. A completed refresh immediately suppresses
