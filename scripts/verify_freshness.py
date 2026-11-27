@@ -205,7 +205,7 @@ def main() -> int:
             time.sleep(15)
         if failures:
             print("Freshness gate failed: " + ", ".join(failures) + ".", file=sys.stderr)
-            return 1
+            return 3 if failures == ["storage critical"] else 1
         print("Committed PropLine receipt matched this collection within five minutes.")
         return 0
 

@@ -34,6 +34,7 @@ on:
       - scripts/collect_kalshi_props.py
       - scripts/run_crypto_paper.py
       - scripts/verify_freshness.py
+      - scripts/recover_propline_receipt.py
       - scripts/check_scheduler_due.py
       - scripts/maintain_storage.py
       - scripts/collect_deep_after_cleanup.py
@@ -73,6 +74,7 @@ jobs:
             scripts/collect_kalshi_props.py \
             scripts/run_crypto_paper.py \
             scripts/verify_freshness.py \
+            scripts/recover_propline_receipt.py \
             scripts/check_scheduler_due.py \
             scripts/maintain_storage.py \
             scripts/collect_deep_after_cleanup.py \
@@ -521,11 +523,20 @@ jobs:
           PROPLINE_STARTED_AT: ${{ steps.propline.outputs.startedAt }}
           PROPLINE_COMPLETED_AT: ${{ steps.propline.outputs.completedAt }}
           CYCLE_KEY: ${{ needs.cadence-gate.outputs.cycle_key }}
-        run: >-
-          python scripts/verify_freshness.py "$SECURUS_URL" --current-propline-receipt
-          --propline-started-at "$PROPLINE_STARTED_AT"
-          --propline-completed-at "$PROPLINE_COMPLETED_AT"
-          --cycle-key "$CYCLE_KEY"
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt_args=(--propline-started-at "$PROPLINE_STARTED_AT"
+                        --propline-completed-at "$PROPLINE_COMPLETED_AT"
+                        --cycle-key "$CYCLE_KEY")
+          status=0
+          python scripts/verify_freshness.py "$SECURUS_URL" --current-propline-receipt "${receipt_args[@]}" || status=$?
+          if [[ "$status" == 3 && -n "$CYCLE_KEY" ]]; then
+            timeout --signal=TERM --kill-after=5s 115s \
+              python scripts/recover_propline_receipt.py "$SECURUS_URL" "${receipt_args[@]}"
+          else
+            exit "$status"
+          fi
 
       - name: Run one verified Crypto paper scan
         id: paper_scan
